@@ -1,0 +1,109 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+This code loads the BMS data into pandas dataframe with a DatetimeIndex to allow time slicing.  It also allows the crequency of the time series to be easily changed with the 'resample' function (for example grouping half hour time series to days or weeks).  
+
+
+Set working directory
+
+```{python}
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# Change file_path as necessary
+file_path = "../Drive files/" 
+
+os.chdir(file_path)
+```
+
+Load files
+
+```{python}
+chiller = pd.read_csv('BMS-2017.csv', sep=',', encoding='ISO-8859-1')
+boiler = pd.read_csv('boiler.csv',sep=',', encoding='ISO-8859-1')
+```
+
+Change the '?Timestamp' variables into datetime format
+
+```{python}
+chiller.rename(columns={'?Timestamp.1': 'dt'}, inplace=True)
+boiler.rename(columns={'?Timestamp': 'dt'}, inplace=True)
+
+import datetime
+def str_to_dt(series):
+    return series.apply(lambda x:
+        datetime.datetime.strptime(x[0:-5], '%d-%b-%y %I:%M:%S %p'))
+
+chiller.dt = str_to_dt(chiller.dt) 
+boiler.dt = str_to_dt(boiler.dt)
+```
+
+Create variables ('all_chillers_kw' & 'all_boilers_kw') which sum all usage
+
+```{python}
+chiller_names = ['A','B1','B2','C']
+kw_vars_ch = ['ML_PH/PH_Chiller_{}_CHW_kW (kW)'.format(
+        i) for i in chiller_names]
+all_chillers_kw = chiller[kw_vars_ch].apply(sum, axis=1)
+all_chillers_kw.name = 'chillers_weekly_kw'
+all_chillers_kw.index = pd.to_datetime(chiller.dt)
+
+boiler_names = ['A','B','C']
+kw_vars_boiler = ['ML_PH/PH_Boiler_{}_HHW_kW (kW)'.format(
+        i) for i in boiler_names]
+all_boilers_kw = boiler[kw_vars_boiler].apply(sum, axis=1)
+all_boilers_kw.name = 'boilers_weekly_kw'
+all_boilers_kw.index = pd.to_datetime(boiler.dt)
+```
+
+Calculate total consumption
+
+```{python}
+chillers_hourly_17 = all_chillers_kw['2017-01-01':'2017-12-31'].resample('1H').sum()
+
+chillers_weekly_17 = all_chillers_kw['2017-01-01':'2017-12-31'].resample('1W').sum()
+boilers_weekly_17 = all_boilers_kw['2017-01-01':'2017-12-31'].resample('1W').sum()
+
+all_kw_17 = pd.concat([chillers_weekly_17,boilers_weekly_17], axis=1)
+```
+
+```{python}
+#convert date-time to date
+all_kw_17.index = all_kw_17.index.date
+```
+
+Create stacked bar plot of weekly chiller and boiler consumption
+
+```{python}
+# Convert half hourly summations to hourly averages
+all_kw_17['chillers_weekly_kw'] = all_kw_17['chillers_weekly_kw']/2
+all_kw_17['boilers_weekly_kw'] = all_kw_17['boilers_weekly_kw']/2
+```
+
+```{python}
+#change collumn names for plotting
+all_kw_17.columns = ['chillers_weekly_kwh', 'boilers_weekly_kwh']
+all_kw_17
+```
+
+```{python}
+#plot the graph
+plt.rcParams.update({'font.size': 20})
+ax = all_kw_17.plot.bar(stacked=True, figsize=(20,14));
+ax.set_xlabel("Date")
+ax.set_ylabel("kWh")
+```

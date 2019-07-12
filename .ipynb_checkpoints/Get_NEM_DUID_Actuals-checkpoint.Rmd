@@ -1,0 +1,474 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+import numpy as np
+import pandas as pd
+
+from zipfile import ZipFile
+
+import io
+import os
+import re
+```
+
+```{python}
+import unittest
+
+import logging
+logging.basicConfig(level=logging.DEBUG,
+                    format=' %(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+logging.disable(0) # switched debug on. 
+logging.disable(logging.DEBUG) # debug and below not reported.
+# logging.disable(logging.INFO)
+# logging.disable(logging.WARNING)
+# logging.disable(logging.ERROR)
+# logging.disable(logging.CRITICAL)
+```
+
+```{python}
+ZIPDIR_root = r'E:\doc\ICT Project\MMSDM_ZIPS'
+extracted_data_root = r'E:\doc\ICT Project\RRP' # don't bother for now.
+```
+
+```{python}
+# prepare keys and values to set up dictionaries of data 
+filename_keys = ['TRADINGPRICE',
+                 'PREDISPATCHPRICE',
+                 'PREDISPATCHREGIONSUM',
+                 'TRADINGREGIONSUM',
+                 'ROOFTOP_PV_ACTUAL',
+                 'ROOFTOP_PV_FORECAST',
+                 'DISPATCH_UNIT_SCADA'
+                 # for 5 min forecasts and actuals according to section 21 of MMS data model:
+                 #'P5MIN_REGIONSOLUTION', 
+                ]
+
+# storage for monthly dataframes as dictionary of lists
+raw_df_dict = {x:dict() for x in filename_keys}
+CONTIGUOUS_DATA_DICT = {x:dict() for x in filename_keys}
+```
+
+```{python}
+raw_cols = {
+    'PREDISPATCHPRICE':[
+#         'I', 
+#         'PREDISPATCH', 
+#         'REGION_PRICES', 
+#         '1', 
+        'PREDISPATCHSEQNO', 
+        'RUNNO', 
+        'REGIONID', 
+        'PERIODID', 
+        'INTERVENTION', 
+        'RRP', 
+        'EEP', 
+#         'RRP1', 'EEP1', 'RRP2', 'EEP2', 'RRP3', 'EEP3', 'RRP4', 'EEP4', 
+#         'RRP5', 'EEP5', 'RRP6', 'EEP6', 'RRP7', 'EEP7', 'RRP8', 'EEP8', 
+        'LASTCHANGED', 'DATETIME', 
+        'RAISE6SECRRP', 'RAISE60SECRRP', 'RAISE5MINRRP', 'RAISEREGRRP', 
+        'LOWER6SECRRP', 'LOWER60SECRRP', 'LOWER5MINRRP', 'LOWERREGRRP'
+    ],
+    
+    
+    'TRADINGPRICE':[
+#         'I', 
+#         'TRADING', 
+#         'PRICE', 
+#         '2', 
+        'SETTLEMENTDATE', 
+#         'RUNNO', 
+        'REGIONID', 
+        'PERIODID', 
+        'RRP', 
+        'EEP', 
+#         'INVALIDFLAG', 
+        'LASTCHANGED', 
+        'ROP', 
+        'RAISE6SECRRP', 'RAISE6SECROP', 'RAISE60SECRRP', 'RAISE60SECROP', 
+        'RAISE5MINRRP', 'RAISE5MINROP', 'RAISEREGRRP', 'RAISEREGROP', 
+        'LOWER6SECRRP', 'LOWER6SECROP', 'LOWER60SECRRP', 'LOWER60SECROP', 
+        'LOWER5MINRRP', 'LOWER5MINROP', 'LOWERREGRRP', 'LOWERREGROP', 
+#         'PRICE_STATUS'        
+    ],
+
+    
+    'PREDISPATCHREGIONSUM':[
+#         'I',
+#         'PREDISPATCH',
+#         'REGION_SOLUTION',
+#         '4',
+        'PREDISPATCHSEQNO',
+#         'RUNNO',
+        'REGIONID',
+        'PERIODID',
+#         'INTERVENTION',
+        'TOTALDEMAND','AVAILABLEGENERATION','AVAILABLELOAD',
+        'DEMANDFORECAST','DISPATCHABLEGENERATION','DISPATCHABLELOAD',
+        'NETINTERCHANGE','EXCESSGENERATION',
+        # lower ancillary markets
+        'LOWER5MINDISPATCH','LOWER5MINIMPORT','LOWER5MINLOCALDISPATCH',
+            'LOWER5MINLOCALPRICE','LOWER5MINLOCALREQ','LOWER5MINPRICE',
+            'LOWER5MINREQ','LOWER5MINSUPPLYPRICE',
+        'LOWER60SECDISPATCH','LOWER60SECIMPORT','LOWER60SECLOCALDISPATCH',
+            'LOWER60SECLOCALPRICE','LOWER60SECLOCALREQ','LOWER60SECPRICE',
+            'LOWER60SECREQ','LOWER60SECSUPPLYPRICE',
+        'LOWER6SECDISPATCH','LOWER6SECIMPORT','LOWER6SECLOCALDISPATCH',
+            'LOWER6SECLOCALPRICE','LOWER6SECLOCALREQ','LOWER6SECPRICE',
+            'LOWER6SECREQ','LOWER6SECSUPPLYPRICE',
+        # raise ancillary markets
+        'RAISE5MINDISPATCH','RAISE5MINIMPORT','RAISE5MINLOCALDISPATCH',
+            'RAISE5MINLOCALPRICE','RAISE5MINLOCALREQ','RAISE5MINPRICE',
+            'RAISE5MINREQ','RAISE5MINSUPPLYPRICE',
+        'RAISE60SECDISPATCH','RAISE60SECIMPORT','RAISE60SECLOCALDISPATCH',
+            'RAISE60SECLOCALPRICE','RAISE60SECLOCALREQ','RAISE60SECPRICE',
+            'RAISE60SECREQ','RAISE60SECSUPPLYPRICE',
+        'RAISE6SECDISPATCH','RAISE6SECIMPORT','RAISE6SECLOCALDISPATCH',
+            'RAISE6SECLOCALPRICE','RAISE6SECLOCALREQ','RAISE6SECPRICE',
+            'RAISE6SECREQ','RAISE6SECSUPPLYPRICE',
+        # extra date stamps
+        'LASTCHANGED',
+        'DATETIME',
+        # supply and dispatch?
+            'INITIALSUPPLY',
+            'CLEAREDSUPPLY',
+            'LOWERREGIMPORT','LOWERREGLOCALDISPATCH',
+            'LOWERREGLOCALREQ','LOWERREGREQ',
+            'RAISEREGIMPORT','RAISEREGLOCALDISPATCH',
+            'RAISEREGLOCALREQ','RAISEREGREQ',
+        # violations - local
+            'RAISE5MINLOCALVIOLATION','RAISEREGLOCALVIOLATION',
+            'RAISE60SECLOCALVIOLATION','RAISE6SECLOCALVIOLATION',
+            'LOWER5MINLOCALVIOLATION','LOWERREGLOCALVIOLATION',
+            'LOWER60SECLOCALVIOLATION','LOWER6SECLOCALVIOLATION',
+        # violations - general
+            'RAISE5MINVIOLATION','RAISEREGVIOLATION',
+            'RAISE60SECVIOLATION','RAISE6SECVIOLATION',
+            'LOWER5MINVIOLATION','LOWERREGVIOLATION',
+            'LOWER60SECVIOLATION','LOWER6SECVIOLATION',
+        # availability 
+            'RAISE6SECACTUALAVAILABILITY',
+            'RAISE60SECACTUALAVAILABILITY',
+            'RAISE5MINACTUALAVAILABILITY',
+            'RAISEREGACTUALAVAILABILITY',
+            'LOWER6SECACTUALAVAILABILITY',
+            'LOWER60SECACTUALAVAILABILITY',
+            'LOWER5MINACTUALAVAILABILITY',
+            'LOWERREGACTUALAVAILABILITY',
+            'DECAVAILABILITY',
+        #
+        'LORSURPLUS','LRCSURPLUS',
+        'TOTALINTERMITTENTGENERATION','DEMAND_AND_NONSCHEDGEN',
+        'UIGF','SEMISCHEDULE_CLEAREDMW','SEMISCHEDULE_COMPLIANCEMW'
+        ],
+    
+    
+    'TRADINGREGIONSUM':[
+#         'I',
+#         'TRADING',
+#         'REGIONSUM',
+#         '4',
+        'SETTLEMENTDATE',
+#         'RUNNO',
+        'REGIONID',
+        'PERIODID',
+        'TOTALDEMAND',
+        'AVAILABLEGENERATION',
+        'AVAILABLELOAD',
+        'DEMANDFORECAST',
+        'DISPATCHABLEGENERATION',
+        'DISPATCHABLELOAD',
+        'NETINTERCHANGE',
+        'EXCESSGENERATION',
+        # lower ancillary markets
+        'LOWER5MINDISPATCH','LOWER5MINIMPORT','LOWER5MINLOCALDISPATCH',
+            'LOWER5MINLOCALPRICE','LOWER5MINLOCALREQ','LOWER5MINPRICE',
+            'LOWER5MINREQ','LOWER5MINSUPPLYPRICE',
+        'LOWER60SECDISPATCH','LOWER60SECIMPORT','LOWER60SECLOCALDISPATCH',
+            'LOWER60SECLOCALPRICE','LOWER60SECLOCALREQ','LOWER60SECPRICE',
+            'LOWER60SECREQ','LOWER60SECSUPPLYPRICE',
+        'LOWER6SECDISPATCH','LOWER6SECIMPORT','LOWER6SECLOCALDISPATCH',
+            'LOWER6SECLOCALPRICE','LOWER6SECLOCALREQ','LOWER6SECPRICE', 
+            'LOWER6SECREQ','LOWER6SECSUPPLYPRICE',
+        # raise ancillary markets
+        'RAISE5MINDISPATCH','RAISE5MINIMPORT','RAISE5MINLOCALDISPATCH',
+            'RAISE5MINLOCALPRICE','RAISE5MINLOCALREQ','RAISE5MINPRICE',
+            'RAISE5MINREQ','RAISE5MINSUPPLYPRICE',
+        'RAISE60SECDISPATCH','RAISE60SECIMPORT','RAISE60SECLOCALDISPATCH',
+            'RAISE60SECLOCALPRICE','RAISE60SECLOCALREQ','RAISE60SECPRICE',
+            'RAISE60SECREQ','RAISE60SECSUPPLYPRICE',
+        'RAISE6SECDISPATCH','RAISE6SECIMPORT','RAISE6SECLOCALDISPATCH',
+            'RAISE6SECLOCALPRICE','RAISE6SECLOCALREQ','RAISE6SECPRICE',
+            'RAISE6SECREQ','RAISE6SECSUPPLYPRICE',
+        # extra dates
+        'LASTCHANGED',
+        'INITIALSUPPLY',
+        'CLEAREDSUPPLY',
+        # supply and dispatch?        
+            'LOWERREGIMPORT','LOWERREGLOCALDISPATCH',
+            'LOWERREGLOCALREQ','LOWERREGREQ',
+            'RAISEREGIMPORT','RAISEREGLOCALDISPATCH',
+            'RAISEREGLOCALREQ','RAISEREGREQ',
+        # violations - local
+            'RAISE5MINLOCALVIOLATION','RAISEREGLOCALVIOLATION',
+            'RAISE60SECLOCALVIOLATION','RAISE6SECLOCALVIOLATION',
+            'LOWER5MINLOCALVIOLATION','LOWERREGLOCALVIOLATION',
+            'LOWER60SECLOCALVIOLATION','LOWER6SECLOCALVIOLATION',
+        # violations - general
+            'RAISE5MINVIOLATION','RAISEREGVIOLATION',
+            'RAISE60SECVIOLATION','RAISE6SECVIOLATION',
+            'LOWER5MINVIOLATION','LOWERREGVIOLATION',
+            'LOWER60SECVIOLATION','LOWER6SECVIOLATION',
+        # 
+        'TOTALINTERMITTENTGENERATION','DEMAND_AND_NONSCHEDGEN','UIGF'
+    ],
+    
+    
+    'P5MIN_REGIONSOLUTION':[
+        'RUN_DATETIME',
+        'INTERVAL_DATETIME',
+        "REGIONID",
+        "RRP",
+        "TOTALDEMAND",
+        "DEMANDFORECAST",
+        "AVAILABLEGENERATION",
+        "AVAILABLELOAD",
+        "DISPATCHABLEGENERATION",
+        "DISPATCHABLELOAD",
+        "NETINTERCHANGE",
+        "INITIALSUPPLY",
+        "CLEAREDSUPPLY"
+    ],
+    
+    'DISPATCH_UNIT_SCADA':[
+#         'I', 
+#         'DISPATCH', 
+#         'UNIT_SCADA', 
+#         '1', 
+        'SETTLEMENTDATE', 
+        'DUID',
+        'SCADAVALUE'
+    ]
+}
+```
+
+```{python}
+raw_indexies = {
+    'PREDISPATCHPRICE':["REGIONID", "PREDISPATCHSEQNO", "PERIODID", 'DATETIME'],
+    'TRADINGPRICE':["REGIONID", "SETTLEMENTDATE"],
+    'PREDISPATCHREGIONSUM':["REGIONID", "PREDISPATCHSEQNO", "PERIODID", 'DATETIME'],
+    'TRADINGREGIONSUM':["REGIONID", "SETTLEMENTDATE"],
+    'P5MIN_REGIONSOLUTION':["REGIONID", 'INTERVAL_DATETIME'],
+    'DISPATCH_UNIT_SCADA':['REGIONID', 'DUID', 'SETTLEMENTDATE']
+}
+
+refined_indexies = {
+    'PREDISPATCHPRICE':["REGIONID", 'PeriodTime', 'DATETIME'],
+    'TRADINGPRICE':["REGIONID", 'PeriodTime'],
+    'PREDISPATCHREGIONSUM':["REGIONID", "PREDISPATCHSEQNO", "PERIODID", 'DATETIME'],
+    'TRADINGREGIONSUM':["REGIONID", "SETTLEMENTDATE"],
+    'P5MIN_REGIONSOLUTION':["REGIONID", 'INTERVAL_DATETIME'],
+    'DISPATCH_UNIT_SCADA':['DUID', 'PeriodTime']
+}
+```
+
+```{python}
+min_to_ns = lambda min: min*60*1000000000
+timedelta_days = lambda days: pd.to_timedelta(min_to_ns(days*24*60))
+```
+
+```{python}
+def internal_zip_filespec(filespec):
+    filename_prefix = r'(.*PUBLIC_DVD_'
+    filename_postfix = r'_\d*\.zip)$'
+    return filename_prefix + filespec + filename_postfix
+
+
+def find_filespec_in_zip(source_zip, search_spec):
+    found_file = [re.match(search_spec, name).group(0) for name in source_zip.namelist() 
+                  if re.match(search_spec, name)]
+    return found_file[0] if len(found_file)==1 else None 
+
+
+def get_dataframe_from_csv(source_zip, search_spec):
+    """a bit of a hack here as we are guessign there is only one CSV per zip file"""
+    internal_zip_name = find_filespec_in_zip(source_zip, search_spec)
+    logger.debug('About to read:\n%s', internal_zip_name)
+    
+    try:
+        zip_file_data = ZipFile(io.BytesIO(source_zip.read(internal_zip_name)))
+#         dfs = {csv_f.filename: pd.read_csv(zip_file_data.open(csv_f.filename), skiprows=[0])
+#                for csv_f in zip_file_data.infolist() 
+#                if csv_f.filename.endswith('.CSV')}
+        dfs = [pd.read_csv(zip_file_data.open(csv_f.filename), skiprows=[0])
+               for csv_f in zip_file_data.infolist() 
+               if csv_f.filename.endswith('.CSV')]
+    
+    except KeyError: 
+        logger.error('%s is not a zip file', internal_zip_name)
+        logger.error('Carry on. Oh, I see that you are.')
+        return pd.DataFrame()
+        
+    return dfs[0]
+
+
+def get_dataframe_from_zip(file_spec, year, month):
+    zip_year = '{:04n}'.format(year)
+    zip_month = 'MMSDM_{:04n}_{:02n}.zip'.format(year, month)
+    logger.debug('looking at %s', os.path.join(zip_year, zip_month)) 
+    df = pd.DataFrame()
+    
+    try:
+        top_level_zip = ZipFile(os.path.join(ZIPDIR_root, zip_year, zip_month), 'r')
+        df = get_dataframe_from_csv(top_level_zip, file_spec)
+        logger.debug('key:\n%s\n', file_spec)    
+    except FileNotFoundError: 
+        logger.error('%s not found.', file_spec)
+        logger.error('Carry on. Oh, I see that you are.')
+    except KeyError: 
+        logger.error('%s is a bad zip file', os.path.join(ZIPDIR_root, zip_year, zip_month))
+    
+    return df
+```
+
+```{python}
+def refine_data(df, file_key):
+    tdf = df.iloc[:-1] # the last line has metadata
+    drop_cols = list(set(tdf.columns) - set(raw_cols[file_key]))
+    tdf.drop(drop_cols, axis=1, inplace=True)
+    
+    if 'PeriodTime' not in tdf.columns:
+        if file_key == 'PREDISPATCHPRICE':
+            tdf = tdf.loc[tdf['INTERVENTION'] == 0.0]
+            tdf.insert(loc=0, column='PeriodTime',
+                       value=(pd.to_datetime(tdf.DATETIME)
+                              - pd.to_timedelta(min_to_ns(30*(tdf.PERIODID-1.0)))) )
+            tdf.DATETIME = pd.to_datetime(tdf.DATETIME)
+        else: 
+            tdf.insert(loc=0, column='PeriodTime',
+                       value=(pd.to_datetime(tdf.SETTLEMENTDATE)) )
+            tdf.drop(['SETTLEMENTDATE'], axis=1, inplace=True)
+            
+    tdf.set_index(refined_indexies[file_key], inplace=True)
+    logger.debug('new: %s', tdf.index.names)
+    
+    logger.debug('df refined')
+    return tdf
+
+
+def get_duid_data(duid):
+    rtn_df = pd.DataFrame()
+    global CONTIGUOUS_DATA_DICT
+    
+    data_spec = 'DISPATCH_UNIT_SCADA'
+     
+    file_spec = internal_zip_filespec(data_spec)
+    
+    logger.debug('looking for `%s` data in the filespec `%s`', duid, file_spec)
+
+    year_month_tags = [int('{:04n}{:02n}'.format(yyyy, mm)) 
+                       for yyyy in range(2009,2019,1) 
+                       for mm in range(1,13,1)]
+    
+    for ymt_tag in year_month_tags:
+        if (ymt_tag) not in CONTIGUOUS_DATA_DICT[data_spec]:
+            logger.debug('looking at ymt_tag %s', ymt_tag)
+            tmp_tag_df = get_dataframe_from_zip(file_spec, ymt_tag // 100, ymt_tag % 100)
+            if not tmp_tag_df.empty:
+                tmp_tag_df = refine_data(tmp_tag_df, data_spec)
+            CONTIGUOUS_DATA_DICT[data_spec][ymt_tag] = tmp_tag_df
+        else: 
+            tmp_tag_df = CONTIGUOUS_DATA_DICT[data_spec][ymt_tag]
+        
+        if not tmp_tag_df.empty:
+            logger.debug('appending data for `%s` with data \n%s', 
+                         duid, tmp_tag_df.loc[duid])
+            rtn_df = rtn_df.append(tmp_tag_df.loc[duid])
+    
+    logger.debug('counts \n%s', rtn_df.count())
+    return rtn_df
+```
+
+```{python}
+
+```
+
+```{python}
+# logging.disable(0) # switched debug on. 
+logging.disable(logging.DEBUG)
+
+def get_DUID_data(duId='STARHLWF'):
+    """ returns a data frame for the given DUID, 
+    showing the power output and any other pertinent data 
+    if the generator is semi-dispatchable
+    """
+    logger.info('\nlooking for data for generation at `%s`', duId)
+    the_data = get_duid_data(duId)
+    
+    
+    return the_data
+```
+
+```{python}
+
+```
+
+```{python}
+import matplotlib.pyplot as plt
+plt.style.use('seaborn')
+
+TEST_DF = pd.DataFrame()
+
+def test_get_DUID():
+    global TEST_DF 
+    duIds = ['STARHLWF', 'SNOWTWN1']
+    for duid in duIds:
+        TEST_DF = get_DUID_data(duid)
+        TEST_DF.plot()
+        plt.title('Output for {}'.format(duid))
+        plt.ylabel('Output (MW)')
+        plt.xlabel('datetime')
+        plt.show()
+        TEST_DF.to_csv(os.path.join(r'C:/tmp/', (duid + '_5min.tsv')), sep='\t')
+        TEST_DF.resample('30T', closed='right', label='right').apply(np.mean).to_csv(
+            os.path.join(r'C:/tmp/', (duid + '_30min.tsv')), sep='\t')   
+    return None
+
+
+class Get_NEM_forecast(unittest.TestCase):
+    
+    def testGetForecast(self):
+        assert test_get_DUID() == None
+```
+
+```{python}
+TEST_DF.count()
+```
+
+```{python}
+
+
+```
+
+```{python}
+if __name__ == '__main__':
+    unittest.main(argv=['ignored', '-v'], exit=False)
+```
+
+```{python}
+raw_cols['DISPATCH_UNIT_SCADA']
+
+```

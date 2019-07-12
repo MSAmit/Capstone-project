@@ -1,0 +1,577 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+Following notes from John Boland, creating a clear sky model model using Fourier analysis
+
+
+### Load packages and data
+
+```{python}
+import datetime as dt
+import ephem
+import matplotlib.pyplot as plt
+from matplotlib import cm
+import matplotlib.dates as mdates
+import numpy as np
+import os
+import pandas as pd
+import scipy
+from sklearn import linear_model
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+from tqdm import tqdm_notebook
+```
+
+Change these years as required.
+
+```{python}
+# Change these years as required.
+from_year = 2010
+to_year = 2017
+
+year_range = range(from_year,to_year+1)
+```
+
+```{python}
+colspec = [(0,2), (3,9), (10,14), (15,17), (18,20), (21,23), (24,26), 
+           (27,34), (35,42), (43,50), (51,58), (59,66), 
+           (67,74), (75,82), (83,90), (91,98), (99,106), 
+           (107,114), (115,122), (123,130), (131,138), (139,146), 
+           (147,154), (155,162), (163,170), (171,178), (179,186), 
+           (187,194), (195,202), (203,210), (211, 218), (219,226), 
+           (227,232), (233,238), (239,244), (245,252)]
+
+headers = ['record_id', 'station_number', 'yr', 'mth', 'day', 'hr', 'mnt', 
+          'mean_global', 'min_global', 'max_global', 'sd_global', 'uncert_mean_global',
+          'mean_direct', 'min_direct', 'max_direct', 'sd_direct', 'uncert_mean_direct',
+          'mean_diffuse', 'min_diffuse', 'max_diffuse', 'sd_diffuse', 'uncert_mean_diffuse',
+          'mean_terr', 'min_terr', 'max_terr', 'sd_terr', 'uncert_mean_terr',
+          'mean_dir_horiz', 'min_dir_horiz', 'max_dir_horiz', 'sd_dir_horiz', 'uncert_dir_horiz',
+          'sunsh_sec_96', 'sunsh_sec_120', 'sunsh_sec_144', 'zenith_dist']
+```
+
+```{python}
+from collections import defaultdict
+
+yr_dict = defaultdict(list)
+
+for yr in tqdm_notebook(year_range):
+    files = os.listdir(f'E:/Adelaide/{yr}/')
+    yr_dict[yr] = pd.DataFrame()
+    for f in tqdm_notebook(files):
+        df = pd.read_fwf(os.path.join(f'E:/Adelaide/{yr}/', f), 
+                         colspecs=colspec, names=headers, index_col=False, skiprows=[0],
+                         parse_dates=[['yr','mth', 'day', 'hr', 'mnt']],
+                         date_parser=lambda yyyy, mm, dd, HH, MM: pd.to_datetime(
+                             (yyyy+mm+dd+HH+MM), format='%Y%m%d%H%M'))
+        yr_dict[yr] = yr_dict[yr].append(df)
+    yr_dict[yr].set_index('yr_mth_day_hr_mnt', drop=True, inplace=True)
+    yr_dict[yr].index.name = 'date_time' 
+    yr_dict[yr].sort_index(ascending=True, inplace=True)
+    
+```
+
+```{python}
+yr_dict[2010].to_csv(os.path.join('..\\Relevant data\\Capstone\\solar\\', f'PV_{2010:4n}.csv'), sep=',')
+```
+
+```{python}
+for yr in tqdm_notebook(yr_dict.keys()):
+    yr_dict[yr].to_csv(os.path.join('..\\Relevant data\\Capstone\\solar\\', f'PV_{yr:4n}.csv'), sep=',')
+```
+
+The solar data was previously consolidated from monthly files into yearly files.  Here, the years are each loaded as values in a dictionary.
+
+```{python}
+PV = {}
+
+for year in tqdm_notebook(year_range):
+    try:
+        PV[str(year)] = pd.read_csv(
+                '..\\Relevant data\\Capstone\\solar\\PV_' + str(year) + '.csv',
+                parse_dates=['date_time'],
+                index_col='date_time')
+    except:
+        pass
+```
+
+```{python}
+# Years for which (some) data is present
+yrs = PV.keys()
+yrs
+```
+
+### Data investigation and transformation
+
+```{python}
+# Merge into a single dataframe
+PV = pd.concat(PV.values())
+PV.head()
+```
+
+```{python}
+# Drop unused columns
+use_cols = ['mean_dir_horiz','mean_diffuse','zenith_dist']
+PV = PV[use_cols]
+```
+
+```{python}
+PV.head()
+```
+
+```{python}
+# Create Global Horizontal Irradiance ('GHI') variable
+PV['GHI'] = PV['mean_dir_horiz'] + PV['mean_diffuse']
+```
+
+```{python}
+# Check for missing data (where there is a timestamp but no measurement of mean_dir_horiz, mean_diffuse, zenith_dist or GHI).
+np.isnan(PV).sum()
+```
+
+```{python}
+# Check for duplicate timestamps
+PV.index.duplicated().sum()
+```
+
+```{python}
+# How many minutes should there be if there are continuous minute timestamps
+# between the first and last timestamps in the series?
+def expected_minutes(ts):
+    return(int((ts.iloc[-1].name - ts.iloc[0].name).total_seconds() / 60 + 1))
+expected_minutes(PV)
+```
+
+```{python}
+# How many timestamps are there actually in the datasets?
+len(PV)
+```
+
+```{python}
+# How many timestamps are missing throughout each year
+expected_minutes(PV) - len(PV)
+```
+
+```{python}
+# Resample using the same frequency to ensure continuous time series
+PV = PV.resample('T').mean()
+```
+
+```{python}
+# Check again for missing timestamps
+expected_minutes(PV) - len(PV)
+```
+
+```{python}
+# Create variables for grouping data
+PV['year'] = PV.index.year
+PV['month_day'] = list(zip(PV.index.month,PV.index.day))
+PV['time_of_day'] = PV.index.time
+```
+
+### Experiments with `ephem` package
+
+
+Get list of previous winter solstices corresponding to each year in the dataset
+
+```{python}
+last_solstice = [str(ephem.previous_solstice(yr)) for yr in yrs]
+last_solstice = [dt.datetime.strptime(i,'%Y/%m/%d %H:%M:%S') for i in last_solstice]
+```
+
+```{python}
+tropical_yr_lengths = [i - j for i, j in zip(last_solstice[1:], last_solstice[:-1])]
+
+for year in tqdm_notebook(tropical_yr_lengths):
+    print(year)
+```
+
+Could these be used to better align minutes of each day with the seasons, rather than just the time of day/day of year?  
+
+
+### Add a timestamp field
+
+
+For now, just use the minutes since the start of the calendar year as the elemental predictor variable.
+
+```{python}
+PV_clear_sky = PV.groupby(['month_day','time_of_day'])['GHI'].max()
+```
+
+```{python}
+PV_clear_sky = pd.DataFrame(PV_clear_sky)
+PV_clear_sky['t'] = range(1,len(PV_clear_sky)+1)
+```
+
+```{python}
+PV_clear_sky.head()
+```
+
+### Extract maximum solar radiation at each minute of each day of the year, from multiple years
+
+
+Use Panda's multi-index to group dataframes by `month_day`, then `time_of_day`, then take the maximum. If at least one of the minutes of the day in each of the years was sunny then this should represent the clear sky maximum, although it could be higher if there is reflection from clouds.
+
+```{python}
+PV_clear_sky.head()
+```
+
+```{python}
+# Helper function - creates a date_time from a time object, for plotting purposes only
+def add_date(t):
+        return dt.datetime.combine(dt.datetime.now().date(), t)
+```
+
+```{python}
+solstice_equinox_dates = {'21 March':(3,21), 
+                          '21 June':(6,21), 
+                          '23 September':(9,23), 
+                          '22 December':(12,22)}
+
+fig, axes = plt.subplots(2,2, sharex=True, sharey=True, figsize=(15,10))
+axes = axes.ravel()
+
+hrs = mdates.HourLocator(interval = 4)
+h_fmt = mdates.DateFormatter("%H:%M")
+
+for i, (k,v) in enumerate(solstice_equinox_dates.items()):
+    axes[i].plot(PV_clear_sky.xs(v,axis=0).index.map(add_date),PV_clear_sky.xs(v, axis=0).GHI, '0.4')
+    axes[i].set_title(k)
+    axes[i].xaxis.set_major_locator(hrs)
+    axes[i].xaxis.set_major_formatter(h_fmt)
+ 
+fig.text(0.5, 0.07, 'Time of day', fontsize=12, ha='center')
+fig.text(0.07, 0.6, 'Global Horizontal Irradiance (Watts)', fontsize=12, ha='center', rotation='vertical')
+fig.subplots_adjust(wspace=0,hspace=0.1)
+fig.suptitle(str('Maximum Global Horizontal Irradiance at each minute of solstice/equinox days from ' \
+                 + str(from_year) + ' until ' + str(to_year+1)), fontsize=15, y=0.95);
+```
+
+```{python}
+plt.plot(PV_clear_sky.iloc[:,:]['GHI'].values, '0.4')
+plt.xlabel('Minutes since start of the calendar year')
+plt.ylabel('Global Horizontal Irradiance (Watts)')
+plt.show;
+```
+
+### Investigate the Power Spectrum
+
+```{python}
+def power_spectrum(dat,freq_num):
+    return(Null)
+    # for each frequency to be graphed
+        # set s1, s2 and s0 to be zero
+        # for each timestamp
+            # set s0 to be the timestamp
+        # Set the first frequency to be zero
+        # Set the first frequency to be the timestamp divided by the number of values
+        # for each frequency except the first
+            # power
+            
+```
+
+```{python}
+# Not yet complete (used John's Excel version instead)
+```
+
+### Build a Fourier Model
+
+```{python}
+# Set frequencies
+daily = 2*np.pi/60/24
+
+freqs = {
+    'daily':daily,
+    'yearly':(1/365.24219)*daily,
+    'half_yearly':(1/365.24219*2)*daily
+        }
+```
+
+Creates a matrix where each column is the individual effect of the sine and cosine for each given frequency at each given timestamp. The row sum is the cumulative effect of all frequencies at each timestamp.
+
+```{python}
+def fourier_terms(time_stamp,**args):
+    M = np.empty(shape=(len(time_stamp),len(args)*2))
+    freq_names = []
+    for i, (k,v) in enumerate(args.items()):
+        M[:,2*i  ] = np.cos(v * time_stamp)
+        M[:,2*i+1] = np.sin(v * time_stamp)
+        freq_names.append(k + '_cos')
+        freq_names.append(k + '_sin')
+    return([M,freq_names])
+```
+
+Apply to our timestamps, creating a set of predictor variables in the `PV_clear_sky` dataframe.
+
+```{python}
+X,X_names = fourier_terms(PV_clear_sky.t,**freqs)
+```
+
+```{python}
+PV_clear_sky = pd.concat([PV_clear_sky,
+                          pd.DataFrame(X, columns=X_names, index=PV_clear_sky.index)],
+                         axis=1)
+```
+
+A more natural fit, with fewer parameters, should be possible if the sine/cosine waves in the fitted Fourier model are permitted to go negative at night time. This is achieved by censoring those observed values at zero, i.e. changing them to be missing in the training data.
+
+These values (and timestamps) are then dropped from the training data. First, the index is replaced with 2016's (a leap year, with all possible month_day tuples) so that dropped timestamps can be easily replaced later.
+
+```{python}
+PV_clear_sky.GHI.replace([0], np.nan, inplace=True)
+```
+
+```{python}
+train = PV_clear_sky.copy()
+train.index = pd.date_range(start='1/1/2016 00:00:00', end='31/12/2016 23:59:00', freq='T')
+train.GHI.replace([0], np.NaN, inplace=True)
+train = train.dropna()
+```
+
+Fit a multiple linear regression model
+
+```{python}
+PV_clear_sky[X_names].head()
+```
+
+```{python}
+mod = sm.OLS(train['GHI'], sm.add_constant(train[X_names]))
+res = mod.fit()
+```
+
+```{python}
+print(res.summary())
+```
+
+Apply the model to our timestamps to get the predictions, then set all predictions that are negative to be zero.
+
+```{python}
+PV_clear_sky['pred'] = (res.params[1:] * PV_clear_sky[X_names]).sum(axis=1) + res.params.const
+PV_clear_sky.loc[PV_clear_sky['pred'] < 0,['pred']] = 0
+```
+
+### Fit to the 15$^{th}$ percentile of the maximum values using quantile regression.
+
+```{python}
+expression = str('GHI ~ ' + ' + '.join(X_names))
+expression
+```
+
+```{python}
+mod_Q15 = smf.quantreg(expression, PV_clear_sky)
+```
+
+```{python}
+res_Q15 = mod_Q15.fit(q=0.15)
+print(res_Q15.summary())
+```
+
+Create predictions and set all negative predictions to be zero.
+
+```{python}
+PV_clear_sky['pred_Q15'] = (res_Q15.params[1:] * PV_clear_sky[X_names]).sum(axis=1) + res_Q15.params.Intercept
+PV_clear_sky.loc[PV_clear_sky['pred_Q15'] < 0,['pred_Q15']] = 0
+```
+
+### Compare model predictions to observed values
+
+```{python}
+solstice_equinox_dates = {'21 March':(3,21), 
+                          '21 June':(6,21), 
+                          '23 September':(9,23), 
+                          '22 December':(12,22)}
+
+fig, axes = plt.subplots(2,2, sharex=True, sharey=True, figsize=(15,10))
+axes = axes.ravel()
+
+hrs = mdates.HourLocator(interval = 4)
+h_fmt = mdates.DateFormatter("%H:%M")
+
+for i, (k,v) in enumerate(solstice_equinox_dates.items()):
+    axes[i].plot(PV_clear_sky.xs(v,axis=0).index.map(add_date),PV_clear_sky.xs(v, axis=0).GHI, '0.4', label='data')
+    axes[i].plot(PV_clear_sky.xs(v,axis=0).index.map(add_date),PV_clear_sky.xs(v, axis=0).pred, 'b-', label='mean')
+    axes[i].plot(PV_clear_sky.xs(v,axis=0).index.map(add_date),PV_clear_sky.xs(v, axis=0).pred_Q15, 'r-', label='15th percentile')
+    axes[i].set_title(k)   
+    axes[i].xaxis.set_major_locator(hrs)
+    axes[i].xaxis.set_major_formatter(h_fmt)
+
+axes[1].legend(loc=0)
+fig.text(0.5, 0.07, 'Time of day', fontsize=12, ha='center')
+fig.text(0.07, 0.6, 'Global Horizontal Irradiance (Watts)', fontsize=12, ha='center', rotation='vertical')
+fig.subplots_adjust(wspace=0,hspace=0.1)
+fig.suptitle(str('Maximum Global Horizontal Irradiance at each minute of solstice/equinox days from ' \
+                 + str(from_year) + ' until ' + str(to_year+1)), fontsize=15, y=0.95);
+```
+
+```{python}
+plt.plot(PV_clear_sky.iloc[:,:]['GHI'].values, '0.4', label='data')
+plt.plot(PV_clear_sky.iloc[:,:]['pred'].values, 'b-', label='mean')
+plt.plot(PV_clear_sky.iloc[:,:]['pred_Q15'].values, 'r-', label='15th percentile')
+plt.xlabel('Minutes since start of the calendar year')
+plt.ylabel('Global Horizontal Irradiance (Watts)')
+plt.legend(loc=0)
+plt.show;
+```
+
+### Apply clear sky model to normalise data
+
+
+Create a variable `t` which indicates the number of minutes since the start of each year, consistent with how the clear sky, Fourier-based model is trained.
+
+```{python}
+PV['t'] = PV.groupby(['year']).cumcount() + 1
+```
+
+```{python}
+X,X_names = fourier_terms(PV.t,**freqs)
+#X = pd.DataFrame(X, columns=X_names, index=PV.index)
+
+PV = pd.concat([PV, pd.DataFrame(X, columns=X_names, index=PV.index)], axis=1)
+```
+
+```{python}
+PV.head()
+```
+
+Create clear sky radiation predictions using both regression to the:
+
+* mean (`pred`), and; 
+* 15$^{th}$ percentile (`pred_Q15`);
+
+of the maximum of every minute in each of the years.
+
+```{python}
+# Mean
+PV['pred'] = (res.params[1:] * PV[X_names]).sum(axis=1) + res.params.const
+PV.loc[PV['pred'] < 0,['pred']] = 0
+
+# 15th percentile
+PV['pred_Q15'] = (res_Q15.params[1:] * PV[X_names]).sum(axis=1) + res_Q15.params.Intercept
+PV.loc[PV['pred_Q15'] < 0,['pred_Q15']] = 0
+```
+
+```{python}
+PV.head()
+```
+
+Check model fit on an actual sunny day
+
+```{python}
+fig,ax = plt.subplots(figsize=(15,8))
+ax.plot(PV['2017-4-3'].pred, label="mean")
+ax.plot(PV['2017-4-3'].pred_Q15, label="15th percentile")
+ax.plot(PV['2017-4-3'].GHI, label="data");
+fig.legend()
+```
+
+The next step is to create a 'normalised' solar power variable, being:
+
+\begin{equation}
+\text{normalised solar power} = \frac{\text{observed GHI}}{\text{predicted clear sky GHI}}
+\end{equation}
+
+Intuitively, this measure describes on a scale of 0 to 1 how sunny it is over a given minute.
+
+Near sunrise and sunset, the calculated normalised solar power can be a division by zero, infinity or a very large number. This is because one of observed GHI or predicted clear sky GHI is very small relative to the other. At these points, the predictions are small not contributing significantly to the overall estimate of solar power generation and can be ignored (set to zero). 
+
+These tails (sunrise and sunset) can be targeted by setting a threshold for the `zenith_dist` variable, indicating the angular distance from directly overhead, ie. 90$^{\circ}$ - solar altitude.
+
+In our case, we will only calculate normalised GHI when the `zenith_dist` is below 80$^{\circ}$.
+
+```{python}
+PV['norm'] = np.nan
+PV['norm_Q15'] = np.nan
+```
+
+```{python}
+PV.to_csv('../Relevant data/Capstone/solar/PV_norm.csv')
+```
+
+```{python}
+PV.loc[PV['zenith_dist'] < 80,'norm'] = PV.GHI / PV.pred
+PV.loc[PV['zenith_dist'] < 80,'norm_Q15'] = PV.GHI / PV.pred_Q15
+```
+
+```{python}
+fig, (ax1,ax2) = plt.subplots(1,2,figsize=(15,5))
+ax1.plot(PV.norm_Q15)
+ax1.set_title('15th Quartile of Max model')
+ax2.plot(PV.norm)
+ax2.set_title('Mean of Max model');
+```
+
+Something needs investigating in late 2003.  What if these outliers are excluded?
+
+```{python}
+fig, (ax1,ax2) = plt.subplots(1,2,figsize=(15,5), sharey=True)
+ax1.plot(PV.norm_Q15['2004':])
+ax1.set_ylabel('Normalised GHI')
+ax1.set_title('15th Quartile of Max model')
+ax2.plot(PV.norm['2004':])
+ax2.set_title('Mean of Max model');
+```
+
+```{python}
+PV.norm.describe()
+```
+
+```{python}
+PV.norm_Q15.describe()
+```
+
+The 'inf' values need further investigating.
+
+Following is the normalised GHI over a partly cloudy day, rather than many years.
+
+```{python}
+fig, ax1 = plt.subplots(1,1,figsize=(15,5), sharey=True)
+ax1.plot(PV.norm_Q15['2017-1-1'])
+ax1.set_ylabel('Normalised GHI')
+ax1.set_title('15th Quartile of Max model')
+ax1.plot(PV.norm['2017-1-1']);
+ax1.set_title('Comparison of normalised GHI using mean or 15th percentile model')
+ax1.set_ylim(0);
+fig.subplots_adjust(wspace=0);
+```
+
+In comparison to the observed GHI and prediction on the same day
+
+```{python}
+fig, ax1 = plt.subplots(1,1,figsize=(15,5), sharey=True)
+ax1.plot(PV.GHI['2017-1-1'])
+ax1.plot(PV.pred_Q15['2017-1-1'])
+ax1.plot(PV.pred['2017-1-1']);
+
+# It would be helpful to insert bands/lines showing range of where zenith_dist < 80 degrees  
+```
+
+Now a sunny day
+
+```{python}
+fig, ax1 = plt.subplots(1,1,figsize=(15,5), sharey=True)
+ax1.plot(PV.norm_Q15['2017-4-3'])
+ax1.plot(PV.norm['2017-4-3'])
+ax1.set_title('Comparison of normalised GHI using mean or 15th percentile model')
+ax1.set_ylim(0);
+```
+
+```{python}
+fig, ax1 = plt.subplots(1,1,figsize=(15,5), sharey=True)
+ax1.plot(PV.GHI['2017-4-3'])
+ax1.plot(PV.pred_Q15['2017-4-3'])
+ax1.plot(PV.pred['2017-4-3']);
+```
+
+The 15$^{th}$ percentile model provides a better overall fit with a straighter line in sunny days but has more of a problem with "horns" at the sunrise/sunset tails.

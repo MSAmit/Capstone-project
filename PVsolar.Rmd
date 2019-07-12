@@ -1,0 +1,107 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+This module takes the '1 minute solar' data from the Bureau of Meteorology.  
+It aggregates the supplied monthly Solar Generation Data into yearly files, process dates and creates CSV files
+
+
+### Import modules and load data
+
+```{python}
+import datetime
+import glob
+import os
+import pandas as pd
+import pytz
+```
+
+```{python}
+# Location of data files (unzipped) relative to working directory
+# data_path = '..\\solar_data'
+data_path = r'..\\Relevant data\\Capstone\\solar\\'
+mths = glob.glob(data_path + "/*.txt")
+```
+
+```{python}
+colspec = [(1,2), (3,9), (10,14), (15,17), (18,20), (21,23), (24,26), 
+           (27,34), (35,42), (43,50), (51,58), (59,66), 
+           (67,74), (75,82), (83,90), (91,98), (99,106), 
+           (107,114), (115,122), (123,130), (131,138), (139,146), 
+           (147,154), (155,162), (163,170), (171,178), (179,186), 
+           (187,194), (195,202), (203,210), (211, 218), (219,226), 
+           (227,232), (233,238), (239,244), (245,252)]
+
+headers = ['record_id', 'station_number', 'yr', 'mth', 'day', 'hr', 'mnt', 
+          'mean_global', 'min_global', 'max_global', 'sd_global', 'uncert_mean_global',
+          'mean_direct', 'min_direct', 'max_direct', 'sd_direct', 'uncert_mean_direct',
+          'mean_diffuse', 'min_diffuse', 'max_diffuse', 'sd_diffuse', 'uncert_mean_diffuse',
+          'mean_terr', 'min_terr', 'max_terr', 'sd_terr', 'uncert_mean_terr',
+          'mean_dir_horiz', 'min_dir_horiz', 'max_dir_horiz', 'sd_dir_horiz', 'uncert_dir_horiz',
+          'sunsh_sec_96', 'sunsh_sec_120', 'sunsh_sec_144', 'zenith_dist']
+```
+
+```{python}
+def load_1_sec_solar(path):
+    return pd.read_fwf(path, colspecs=colspec, names=headers, index_col=False, skiprows=[0])
+```
+
+```{python}
+from_year = 2016
+to_year = 2017
+```
+
+```{python}
+# Create dictionary of dataframes corresponding to each year specified below:
+from_year = 2016
+to_year = 2017
+
+solar = {}
+
+for year in range(from_year,to_year+1):
+    solar['PV_' + str(year)] = pd.concat(
+        (load_1_sec_solar(f) for f in mths if f.split('_')[-2] == str(year)), ignore_index=True)
+```
+
+### Process date fields and move to index
+
+```{python}
+# Check continuity of time information - any duplicates?
+solar['PV_' + str(to_year)].duplicated(['yr','mth','day','hr','mnt']).sum()
+```
+
+There are no duplicate dates, which would be the case if the datetime represented local time accounting for daylight saving. The BOM's description of the date [here](http://www.bom.gov.au/climate/data/oneminsolar/IDCJAC0022-format.txt) suggests that it is local standard time, so ignores daylight saving.
+
+In this case, it might be best to use a timezone naive DatetimeIndex.
+
+```{python}
+for key, df in solar.items():
+    dt = df.apply(lambda x: datetime.datetime(x['yr'], x['mth'], x['day'], x['hr'], x['mnt']), axis=1)
+    df['date_time'] = dt
+    df.drop(['yr', 'mth', 'day', 'hr', 'mnt'], axis=1, inplace=True)
+    df.set_index('date_time', inplace=True)
+```
+
+Check the number of rows in each year's dataframe
+
+```{python}
+for key, df in solar.items():
+    print(key,':',len(df),'rows')
+```
+
+### Save to csv files for further analysis
+
+```{python}
+# for key, df in solar.items():
+#     df.to_csv('..\\Relevant data\\Capstone\\solar\\' + key + '.csv')
+```

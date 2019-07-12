@@ -1,0 +1,145 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+This file is where I got my ideas toghether for a file updater, there are some nice bits and pieces in here.  Ultimately I will republish the useful bits as a straight .py file maybe as a package, or just a collection of functions.
+
+```{python}
+import numpy as np
+import pandas as pd
+import os
+import re
+
+import requests
+from bs4 import BeautifulSoup # To scrape data
+```
+
+```{python}
+import unittest
+
+import logging
+logging.basicConfig(level=logging.DEBUG,
+                    format=' %(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+logging.disable(0) # switched debug on. 
+logging.disable(logging.DEBUG) # debug and below not reported.
+# logging.disable(logging.INFO)
+# logging.disable(logging.WARNING)
+# logging.disable(logging.ERROR)
+# logging.disable(logging.CRITICAL)
+```
+
+```{python}
+nemweb_url = r'http://nemweb.com.au/'
+MMSDM_archive_url = nemweb_url + r'Data_Archive/Wholesale_Electricity/MMSDM/'
+ZIPDIR_root = r'E:\doc\ICT Project\MMSDM_ZIPS'
+```
+
+from the `not_lacie()` example at the beautiful soup documentation page: https://www.crummy.com/software/BeautifulSoup/bs4/doc/#attrs
+
+```{python}
+def is_year_ref(href):
+    return href and re.compile('(.*\d{4}\/$)').search(href)  # a href and last 5 chars in a string are yyyy/
+
+def is_month_zip(href):
+    return href and re.compile('(.*\d{4}\_\d{2}\.zip$)').search(href)
+```
+
+```{python}
+def get_year_urls(url):
+    try: 
+        r = requests.get(url)
+        if r.ok: return [item['href'] for item in
+                         BeautifulSoup(r.text, 'html.parser').find_all(href=is_year_ref)]
+    except: 
+        logger.critical('cannot get to url: %s', url)
+        return None
+
+def get_remote_zip(year_rl):
+    url = nemweb_url + year_rl
+    try: 
+        r = requests.get(url)
+        if r.ok: return [item['href'][-17:] for item in
+                         BeautifulSoup(r.text, 'html.parser').find_all(href=is_month_zip)]
+    except: 
+        logger.critical('cannot get to url: %s', url)
+        return None
+    
+def get_local_zip(year_rl):
+    return os.listdir(os.path.join(ZIPDIR_root, year_rl[-5:-1]))
+```
+
+```{python}
+def update_zips():
+    remote_zip_files = list() 
+    local_zip_files = list()
+
+    for year_rl in get_year_urls(MMSDM_archive_url): 
+        remote_zip_files.extend(get_remote_zip(year_rl))  
+        local_zip_files.extend(get_local_zip(year_rl))    
+
+    logger.debug('remote file names: \n%s', remote_zip_files)
+    logger.debug('local file names: \n%s', local_zip_files)
+
+    remote_file_set = set(); remote_file_set = set(remote_zip_files)
+    local_file_set = set(); local_file_set = set(local_zip_files)
+
+    missing_files = remote_file_set - local_file_set #assume there are more remotes than locals
+
+    logger.debug('The set of missing files:\n%s', missing_files)
+
+    for zip_file in missing_files:
+        year = zip_file[6:10]
+        file_url = MMSDM_archive_url+year+'/'+zip_file
+        file_local = os.path.join(ZIPDIR_root, year, zip_file)
+        logger.info('looking for remote:\n%s', file_url)
+        logger.info('and saving to local:\n%s', file_local)
+
+        if not os.path.exists(os.path.join(ZIPDIR_root, year)): 
+            os.makedirs(os.path.join(ZIPDIR_root, year))
+
+        # the following bits of code need to be done where there is a good data connection 
+        # i.e. not at home:
+
+        r = requests.get(file_url, stream=True) # stream=True as data is big
+        with open(file_local, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=512): # Over 2gig of data, need to stream it in chunks
+                if chunk: f.write(chunk) # filter out keep-alive new chunks
+
+        logger.info('\n%s - saved locally', file_local)
+    else: logger.info('No new files to transfer.')
+        
+    return None
+```
+
+Using the prototype `monkey see, monkey do` for unit testing from: https://stackoverflow.com/questions/37895781/unable-to-run-unittests-main-function-in-ipython-jupyter-notebook#38012249
+
+the return code is alway going to be None, but now I can run this in stand alone, or as an integrated module.
+
+```{python}
+class Get_NEM_Zip_Archive(unittest.TestCase):
+
+    def testUpdate(self):
+        assert update_zips() == None
+
+```
+
+```{python}
+if __name__ == '__main__':
+    unittest.main(argv=['ignored', '-v'], exit=False)
+```
+
+```{python}
+
+```

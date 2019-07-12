@@ -1,0 +1,53 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+## Import Observation data for Adelaide Airport
+
+
+This code extracts the latest observations from the BOM website for Adelaide Airport.  Subscription access is required for historic observations at half-hourly level. If we obtain it, hopefully the same code can be recycled.
+
+```{python}
+import datetime
+import pandas as pd
+import pytz
+import requests
+
+url = 'http://www.bom.gov.au/fwo/IDS60901/IDS60901.94672.json'
+r = requests.get(url)
+obs = r.json()
+```
+
+```{python}
+ADL_obs = pd.DataFrame(obs['observations']['data'])
+```
+
+```{python}
+ACST = pytz.timezone('Australia/Adelaide')
+
+# Create a datetime index
+ADL_obs['date_time'] = ADL_obs.aifstime_utc.apply(
+    lambda x: pytz.timezone('UTC').localize(datetime.datetime.strptime(x,'%Y%m%d%H%M%S')).astimezone(ACST))
+ADL_obs.date_time = pd.to_datetime(ADL_obs.date_time)
+ADL_obs = ADL_obs.drop(['aifstime_utc'], axis=1)
+ADL_obs = ADL_obs.set_index('date_time')
+```
+
+```{python}
+ADL_obs
+```
+
+```{python}
+# Last recorded observation available
+ADL_obs.index[0]
+```

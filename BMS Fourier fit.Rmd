@@ -1,0 +1,494 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+import logging
+
+# Change file_path as necessary
+file_path = "../Relevant data" 
+
+os.chdir(file_path)
+```
+
+```{python}
+import scipy
+from sklearn import linear_model
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+```
+
+```{python}
+bms_13to17 = pd.read_csv("bms_13to17_kW_est.csv", parse_dates=True)
+bms_13to17.TimeStamp = pd.to_datetime(bms_13to17.TimeStamp)
+#bms_13to17 = bms_13to17.drop('level_0', axis = 1)
+bms_13to17
+```
+
+```{python}
+bms_13to17_copy =bms_13to17.set_index(bms_13to17.TimeStamp).fillna(0)
+bms_13to17_copy = bms_13to17_copy[['kW_est']]
+bms_13to17_copy
+```
+
+```{python}
+normal_weekdays = bms_13to17[bms_13to17.Type_of_day == 'Normal_Weekday'].reset_index()
+normal_weekdays = normal_weekdays.drop('level_0', axis = 1)
+normal_weekdays
+```
+
+```{python}
+#checking trend and seasonality in data
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+result = seasonal_decompose(bms_13to17_copy, model='additive',freq=421)
+#print(result.trend)
+#print(result.seasonal)
+#print(result.resid)
+#print(result.observed)
+result.plot()
+result.seasonal[1:300].plot()
+```
+
+```{python}
+# Adapted from John Boland's 'Power_Spectrum_Rwine.xls' worksheet\n",
+
+def power(values,timestamps,freq):
+    N2 = len(values)/2
+    cos_power = (np.cos(np.pi*(freq-1)/N2*timestamps)*values)[1:].sum()/N2
+    sin_power = (np.sin(np.pi*(freq-1)/N2*timestamps)*values)[1:].sum()/N2
+    return cos_power**2 + sin_power**2
+
+```
+
+```{python}
+powerlist = []
+for i in range(1,4000):
+    powerlist.append(power(normal_weekdays.kW_est.values, pd.Series(range(1,60529)),i))
+    
+powerlist
+```
+
+```{python}
+powerseries = pd.Series(powerlist)
+df = powerseries.nlargest(50).sort_values(ascending = False).reset_index()
+df['day_cycles'] = (df[df.columns[0]] + 1) / 48
+df
+```
+
+```{python}
+df[df.columns[1]].plot()
+```
+
+```{python}
+# Set frequencies
+daily = 2*np.pi/2/24
+
+freqs = {
+    'daily':daily,
+    'yearly':(1/365.24219)*daily,
+    'half_yearly':(1/365.24219*2)*daily,
+    'twice_a_day' : 2*daily
+    #'freq1' : daily/3.8,
+    #'freq2' : daily/7.68,
+    #'freq3' : daily/ 0.0413,
+    #'freq4' : daily/0.0645
+        }
+```
+
+```{python}
+def fourier_terms(time_stamp,**args):
+    M = np.empty(shape=(len(time_stamp),len(args)*2))
+    freq_names = []
+    for i, (k,v) in enumerate(args.items()):
+        M[:,2*i  ] = np.cos(v * time_stamp)
+        M[:,2*i+1] = np.sin(v * time_stamp)
+        freq_names.append(k + '_cos')
+        freq_names.append(k + '_sin')
+    return([M,freq_names])
+```
+
+```{python}
+X,X_names = fourier_terms(normal_weekdays.index.values,**freqs)
+```
+
+```{python}
+normal_weekdays_withfits = pd.concat([normal_weekdays,
+                          pd.DataFrame(X, columns=X_names, index=normal_weekdays.index)],
+                         axis=1)
+normal_weekdays_withfits
+```
+
+```{python}
+mod = sm.OLS(normal_weekdays_withfits['kW_est'], sm.add_constant(normal_weekdays_withfits[X_names]))
+res = mod.fit()
+print(res.summary())
+```
+
+```{python}
+normal_weekdays_withfits['pred'] = (res.params[1:] * normal_weekdays_withfits[X_names]).sum(axis=1) + res.params.const
+ax = normal_weekdays_withfits.iloc[100:500].plot(y=['kW_est','pred'] ,figsize=(20,10))
+ax.set_xlabel("Time")
+ax.set_ylabel("kW")
+```
+
+```{python}
+#Fourier series for weekends and public holidays
+#extract data
+weekends_publicholidays = bms_13to17[bms_13to17.Type_of_day != 'Normal_Weekday'].reset_index()
+weekends_publicholidays = weekends_publicholidays.drop('level_0', axis = 1)
+weekends_publicholidays
+```
+
+```{python}
+X,X_names = fourier_terms(weekends_publicholidays.index.values,**freqs)
+weekends_publicholidays_fits = pd.concat([weekends_publicholidays,
+                          pd.DataFrame(X, columns=X_names, index=weekends_publicholidays.index)],
+                         axis=1)
+mod = sm.OLS(weekends_publicholidays_fits['kW_est'], sm.add_constant(weekends_publicholidays_fits[X_names]))
+res = mod.fit()
+print(res.summary())
+```
+
+```{python}
+weekends_publicholidays_fits['pred'] = (res.params[1:] * weekends_publicholidays_fits[X_names]).sum(axis=1) + res.params.const
+weekends_publicholidays_fits.iloc[100:500].plot(y=['kW_est','pred'] ,figsize=(20,10))
+ax.set_xlabel("Time")
+ax.set_ylabel("kW")
+```
+
+```{python}
+#get future weekend predictions
+
+```
+
+```{python}
+combinedfits = pd.concat([weekends_publicholidays_fits,normal_weekdays_withfits], axis = 0).sort_values('TimeStamp').reset_index()
+combinedfits = combinedfits.drop('level_0', axis = 1)
+ax = combinedfits.iloc[100:1000].plot(x= "TimeStamp",y=['kW_est','pred'] ,figsize=(20,10))
+ax.set_ylabel("kW")
+```
+
+```{python}
+#Getting residuals after modelling the seasonality
+combinedfits['resids_from_fourier'] = combinedfits['kW_est'] - combinedfits['pred']
+combinedfits['resids_from_fourier'][1:1000].plot()
+```
+
+```{python}
+model = sm.OLS(combinedfits['resids_from_fourier'], combinedfits[['Temp', 'Humidity']]).fit()
+combinedfits['regression_fits'] = model.predict(combinedfits[['Temp', 'Humidity']])
+print(model.summary()) 
+```
+
+```{python}
+#ARIMAX with Temp Humidity and residuals
+import math
+from statsmodels.tsa.stattools import acf, pacf
+import statsmodels.tsa.stattools as ts
+from statsmodels.tsa.arima_model import ARIMA
+from statsmodels.tsa.arima_model import ARMAResults
+```
+
+```{python}
+#pre ARIMA analysis
+demand = combinedfits['resids_from_fourier']
+
+plt.plot(demand)
+plt.show()
+acf_1 =  acf(demand)[1:20]
+plt.plot(acf_1)
+plt.show()
+test_df = pd.DataFrame([acf_1]).T
+test_df.columns = ['Pandas Autocorrelation']
+test_df.index += 1
+test_df.plot(kind='bar')
+pacf_1 =  pacf(demand)[1:20]
+plt.plot(pacf_1)
+plt.show()
+test_df = pd.DataFrame([pacf_1]).T
+test_df.columns = ['Pandas Partial Autocorrelation']
+test_df.index += 1
+test_df.plot(kind='bar')
+result = ts.adfuller(demand, 1)
+result
+```
+
+```{python}
+#ARIMAX model
+arimax_model=ARIMA(endog=combinedfits['resids_from_fourier'],exog=combinedfits[['Temp','Humidity']],order=[2,0,0])
+results3=arimax_model.fit()
+print(results3.summary())
+```
+
+```{python}
+ax = combinedfits.loc[8000:9000].plot(x='TimeStamp', y=['kW_est','pred'] ,figsize=(20,10), grid=True  )
+ax.set_ylabel("kW")
+```
+
+```{python}
+fits = results3.fittedvalues
+#append 0 in first element if differenced for modelling
+#fits = np.concatenate([[0],fits])
+combinedfits['arimax_fits'] = combinedfits['pred'] + fits
+combinedfits['arimax_resids'] = combinedfits['kW_est'] - combinedfits['arimax_fits']
+ax = combinedfits.loc[6000:6500].plot(x='TimeStamp', y=['kW_est','pred','arimax_fits'] ,figsize=(20,10), grid=True  )
+ax.set_ylabel("kW")
+```
+
+```{python}
+ax = combinedfits.loc[6000:6500].plot(x='TimeStamp', y=['resids_from_fourier','arimax_resids'] ,figsize=(20,10), grid=True  )
+ax.set_ylabel("Residuals")
+```
+
+```{python}
+#Future predictions/ validation
+combinedfits
+```
+
+```{python}
+validation_data = pd.read_csv("validation_2018_est.csv", sep=',', encoding='utf-8', parse_dates=True)
+validation_data.kW_est.plot()
+```
+
+```{python}
+weekend_validation = validation_data[validation_data.Type_of_day != 'Normal_Weekday'].reset_index()
+weekend_validation.kW_est.plot()
+```
+
+```{python}
+weekday_validation = validation_data[validation_data.Type_of_day == 'Normal_Weekday'].reset_index()
+weekday_validation.kW_est.plot()
+```
+
+```{python}
+
+def fourier_weekend_prediction_terms(t):
+    const  =   928.8323      
+    daily_cos =        -35.2935     
+    daily_sin  =       -69.3803     
+    yearly_cos  =       27.7699     
+    yearly_sin   =     -20.9136     
+    half_yearly_cos =    5.1950     
+    half_yearly_sin  =  11.0240     
+    twice_a_day_cos  =   3.7912     
+    twice_a_day_sin  =  28.6538  
+    predicted_value = const + daily_cos*np.cos(freqs['daily'] * t) + daily_sin*np.sin(freqs['daily'] * t) + yearly_cos*np.cos(freqs['yearly'] * t) + yearly_sin*np.sin(freqs['yearly'] * t) + half_yearly_cos *np.cos(freqs['half_yearly'] * t) + half_yearly_sin*np.sin(freqs['half_yearly'] * t) +  twice_a_day_cos *np.cos(freqs['twice_a_day'] * t) + twice_a_day_sin*np.sin(freqs['twice_a_day'] * t) 
+    return(predicted_value)
+
+```
+
+```{python}
+weekend_validation['indices'] = weekend_validation.index + 27120
+weekend_validation['fourier_predictions'] = weekend_validation['indices'].apply(lambda x: fourier_weekend_prediction_terms(x))
+weekend_validation.plot(x='TimeStamp', y=['kW_est','fourier_predictions'] ,figsize=(20,10), grid=True  )
+```
+
+```{python}
+
+def fourier_weekday_prediction_terms(t):
+    const       = 1377.2326      
+    daily_cos     =   -576.0014    
+    daily_sin      =  -158.0142    
+    yearly_cos      =   11.2980    
+    yearly_sin       =   0.2650    
+    half_yearly_cos  =  -2.4927    
+    half_yearly_sin  =   4.6782    
+    twice_a_day_cos  = 103.3178    
+    twice_a_day_sin  =  54.7993 
+    predicted_value = const + daily_cos*np.cos(freqs['daily'] * t) + daily_sin*np.sin(freqs['daily'] * t) + yearly_cos*np.cos(freqs['yearly'] * t) + yearly_sin*np.sin(freqs['yearly'] * t) + half_yearly_cos *np.cos(freqs['half_yearly'] * t) + half_yearly_sin*np.sin(freqs['half_yearly'] * t) +  twice_a_day_cos *np.cos(freqs['twice_a_day'] * t) + twice_a_day_sin*np.sin(freqs['twice_a_day'] * t) 
+    return(predicted_value)
+```
+
+```{python}
+weekday_validation['indices'] = weekday_validation.index + 60528 
+weekday_validation['fourier_predictions'] = weekday_validation['indices'].apply(lambda x: fourier_weekday_prediction_terms(x))
+weekday_validation.plot(x='TimeStamp', y=['kW_est','fourier_predictions'] ,figsize=(20,10), grid=True )
+```
+
+```{python}
+combined_validation = pd.concat([weekday_validation,weekend_validation], axis = 0).sort_values('TimeStamp').reset_index()
+combined_validation.plot(x='TimeStamp', y=['kW_est','fourier_predictions'] ,figsize=(20,10), grid=True )
+```
+
+```{python}
+#Fourier predictions for future
+future_resids = results3.predict(start = 87648 , end = 88127, exog = validation_data[['Temp','Humidity']])
+future_resids.values
+```
+
+```{python}
+#Adding ARIMAX predictions to Fourier seasonal model
+combined_validation['final_predictions'] = combined_validation['fourier_predictions'] + future_resids.values
+combined_validation
+```
+
+```{python}
+combined_validation.plot(x='TimeStamp', y=['kW_est','final_predictions'] ,figsize=(20,10), grid=True )
+```
+
+```{python}
+#Divide estimates into Thermal / electric loads and export for cost calculation
+combined_validation['thermal load (kWr)'] = combined_validation['final_predictions'] * 0.60
+combined_validation['electrical load (kWe)'] = combined_validation['final_predictions'] * 0.40
+combined_validation.to_csv('final_prediction.csv', sep = '\t')
+```
+
+```{python}
+import sys, string, os
+
+def run_cooling_exe(inputfile, outputfile):
+    filename = "Cooling.exe " + inputfile + " " + outputfile
+    return os.system(filename) 
+```
+
+```{python}
+def calculate_costs(output):
+    #Cost calculation Sample input data
+    output['final_consumption'] = (output['thermal load (kW)']/output['COP']) + output['electrical load (kW)'] - output['solar (kW)']
+    output['final_cost'] = np.where(output['final_consumption'] > 0, output['final_consumption']* output['import price ($/kWh)'] * 2, output['final_consumption']* output['export price ($/kWh)'] * 2)
+    #final total cost for the input data
+    total_cost =  output.final_cost.sum()
+    return total_cost
+```
+
+```{python}
+#Sample input to cooling exe
+sample_input = pd.read_csv("tmp_fwindow.tsv", sep = '\t',skiprows = 7)
+```
+
+```{python}
+#construct baseline input file
+baseline_input = sample_input
+baseline_input.drop(baseline_input.index, inplace = True)
+baseline_input['time'] = combined_validation['TimeStamp'][0:144]
+avg_thermal_load = combined_validation['thermal load (kWr)'].mean()
+baseline_input['thermal load (kWr)'] = avg_thermal_load
+
+avg_electrical_load = combined_validation['electrical load (kWe)'].mean()
+baseline_input['electrical load (kWe)'] = avg_electrical_load
+
+#Import prices, export prices and demand prices
+Luis_file = pd.read_csv("3dayInputData.csv")
+baseline_input['CoP'] = Luis_file['CoP']
+baseline_input['import price ($/kWh)'] = Luis_file['adj_cpkWh']
+baseline_input['export price ($/kWh)'] = Luis_file['exp_cpkWh']
+baseline_input['demand price ($/kW)'] = Luis_file['tou_cpkWh']
+
+
+#Average Solar imported from other prediction
+solar_predictions = pd.read_csv("../code/solar_pv_forecasts.csv")
+baseline_input['solar (kWe)'] = solar_predictions.mean_model
+baseline_input
+
+#export baseline input file and later add first 7 rows manually
+baseline_input.to_csv('baseline_input.tsv', sep = '\t', index = False)
+```
+
+```{python}
+#construct predicted input file
+predicted_input = sample_input
+predicted_input.drop(predicted_input.index, inplace = True)
+predicted_input['time'] = combined_validation['TimeStamp'][0:144]
+
+predicted_input['thermal load (kWr)'] = combined_validation['thermal load (kWr)']
+
+predicted_input['electrical load (kWe)'] = combined_validation['electrical load (kWe)']
+
+#Import prices, export prices and demand prices
+Luis_file = pd.read_csv("3dayInputData.csv")
+predicted_input['CoP'] = Luis_file['CoP']
+predicted_input['import price ($/kWh)'] = Luis_file['adj_cpkWh']
+predicted_input['export price ($/kWh)'] = Luis_file['exp_cpkWh']
+predicted_input['demand price ($/kW)'] = Luis_file['tou_cpkWh']
+
+
+#Average Solar imported from other prediction
+solar_predictions = pd.read_csv("../code/solar_pv_forecasts.csv")
+predicted_input['solar (kWe)'] = solar_predictions.GHI_pred
+predicted_input
+
+#export predicted input file and later add first 7 rows manually
+predicted_input.to_csv('predicted_input.tsv', sep = '\t', index = False)
+```
+
+```{python}
+#construct actual input file
+actual_input = sample_input
+actual_input.drop(actual_input.index, inplace = True)
+actual_input['time'] = combined_validation['TimeStamp'][0:144]
+
+actual_input['thermal load (kWr)'] = combined_validation['kW_est'] * 0.60
+
+actual_input['electrical load (kWe)'] = combined_validation['kW_est'] * 0.40
+
+#Import prices, export prices and demand prices
+Luis_file = pd.read_csv("3dayInputData.csv")
+actual_input['CoP'] = Luis_file['CoP']
+actual_input['import price ($/kWh)'] = Luis_file['adj_cpkWh']
+actual_input['export price ($/kWh)'] = Luis_file['exp_cpkWh']
+actual_input['demand price ($/kW)'] = Luis_file['tou_cpkWh']
+
+
+#Average Solar imported from other prediction
+solar_predictions = pd.read_csv("../code/solar_pv_forecasts.csv")
+actual_input['solar (kWe)'] = solar_predictions.GHI_observed
+actual_input
+
+#export predicted input file and later add first 7 rows manually
+actual_input.to_csv('actual_input.tsv', sep = '\t', index = False)
+```
+
+```{python}
+#run cooling exe file with sample input
+def run_cost_calculation(inputfilename, outputfilename):
+    status = run_cooling_exe(inputfilename, outputfilename)
+    if(status == 0):
+        print("Successful")
+        output = pd.read_csv(outputfilename + ".tsv", sep = '\t')
+        cost = calculate_costs(output)
+        print("The final cost is: ")
+        print(cost)
+    else:
+        print("Not successful")
+
+```
+
+```{python}
+run_cost_calculation("tmp_fwindow", "sample_output")
+```
+
+```{python}
+run_cost_calculation("baseline_input", "baseline_output")
+```
+
+```{python}
+run_cost_calculation("predicted_input", "predicted_output")
+```
+
+```{python}
+1394352.8324047616 - 1277596.031578
+```
+
+```{python}
+run_cost_calculation("actual_input", "actual_output")
+```
+
+```{python}
+1277596.031578 - 713289.9536772382
+```

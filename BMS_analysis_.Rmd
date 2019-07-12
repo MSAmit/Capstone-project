@@ -1,0 +1,407 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+# %autosave 0
+```
+
+# Introduction
+State notebook purpose here
+
+
+### Imports
+Import libraries and write settings here.
+
+```{python}
+# module loads
+import os
+import re
+import subprocess
+import sys
+
+import numpy as np
+import pandas as pd
+
+# Options for pandas
+pd.options.display.max_columns = 50
+pd.options.display.max_rows = 30
+
+
+# Performance and logging
+
+from tqdm import tqdm
+from tqdm import tnrange, tqdm_notebook
+import logging
+logging.basicConfig(level=logging.DEBUG,
+                    format=' %(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+logging.disable(0) # switched debug on. 
+logging.disable(logging.DEBUG) # debug and below not reported.
+# logging.disable(logging.INFO)
+# logging.disable(logging.WARNING)
+# logging.disable(logging.ERROR)
+# logging.disable(logging.CRITICAL)
+
+#Import local utility notebooks:
+if r'./util' not in sys.path: sys.path.append(r'./util')
+
+# from notebook_import import *
+
+# Display all cell outputs
+from IPython.core.interactiveshell import InteractiveShell
+InteractiveShell.ast_node_interactivity = 'all'
+from IPython import get_ipython
+ipython = get_ipython()
+# autoreload extension
+if 'autoreload' not in ipython.extension_manager.loaded:
+    %load_ext autoreload
+# %autoreload 2
+## Visualizations
+#import plotly.plotly as py
+#import plotly.graph_objs as go
+#from plotly.offline import iplot, init_notebook_mode
+#init_notebook_mode(connected=True)
+#import cufflinks as cf
+#cf.go_offline(connected=True)
+#cf.set_config_file(theme='white')
+```
+
+## local utility functions
+
+```{python}
+def identify_type_of_day(date):
+    weekno = date.weekday()
+    #Ignoring the major study breaks as this is not much importance
+    #if((date.month == 7 and week_of_month(date) < 4 ) or (date.month == 12 or date.month == 1 or date.month == 2)):
+    #    return 'Major_study_break'
+    if weekno>4:
+        return 'Weekend'
+    elif is_public_holiday(date):
+        return 'Public_holiday'
+    else:
+        return 'Normal_Weekday'
+
+#Week of month
+from math import ceil
+
+def week_of_month(dt):
+    """ Returns the week of the month for the specified date.
+    """
+    first_day = dt.replace(day=1)
+
+    dom = dt.day
+    adjusted_dom = dom + first_day.weekday()
+
+    return int(ceil(adjusted_dom/7.0))
+
+#Returns True if it's  public holiday
+def is_public_holiday(dt):
+    #public_holiday file for year 2017, use API/ file having multiple year's records to apply for different years
+    public_holidays =  pd.read_csv('australianpublicholidays.csv', sep=',', encoding='ISO-8859-1', 
+                                   parse_dates=['Date'],
+                                   date_parser=lambda x: pd.to_datetime(x))
+    """Instead API could be used : 
+    import urllib
+    url = 'https://data.gov.au/api/3/action/datastore_search?resource_id=253d63c0-af1f-4f4c-b8d5-eb9d9b1d46ab&limit=5&q=title:jones'  
+#     fileobj = urllib.urlopen(url)
+#     print (fileobj.read())
+    public_holidays = pd.read_csv(url, sep=',', encoding='ISO-8859-1', parse_dates=['Date'],
+                 date_parser=lambda x: pd.to_datetime(x))
+    """
+    
+    #get public holidays of SA only
+    public_holidays_SA = public_holidays[public_holidays['Applicable To'].str.contains("SA") | public_holidays['Applicable To'].str.contains("NAT")]
+    
+    #Return True if each date is public holiday in SA
+    return pd.to_datetime(dt).date() in (public_holidays_SA['Date'].apply(lambda x: datetime.date(x))).values
+
+```
+
+```{python}
+#reads a csv file, adds a day type column, creates a csv file with day type column and returns a dataframe object with day type
+def add_day_type_column(file, date_column):
+    data_file = pd.read_csv(file, sep=',', encoding='ISO-8859-1', parse_dates=[date_column],
+                 date_parser=lambda x: pd.to_datetime(x.rsplit(' ', 1)[0]))
+    data_file['Type_of_day'] = data_file[date_column].apply(lambda x: identify_type_of_day(datetime.date(x)))
+    file_name = file + '_with_day_type.csv'
+    #uncomment next line if you want a new file to be created with day type column
+    #data_file.to_csv(file_name, sep=',', encoding='utf-8')
+    return data_file
+
+```
+
+```{python}
+import logging
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+# ### estimate campus power
+# 
+# The bulk of the data is for kVA values. Estimated the real power drawn from this based on the mean power factor for the data we did have. 
+
+# In[8]:
+
+def campus_power_estimation(bms):
+    """Estimate real power form kVA value based on average pf of the 
+        small set of paired values we do have
+    """
+    
+    #bms[bms['ML_PH/Main_11kV_kW (kW)'] > 0.0]['ML_PH/Main_11kV_kW (kW)'] / bms[bms['ML_PH/Main_11kV_kW (kW)'] > 0.0]['ML_PH/Main_11kV_kVA (kVA)']
+
+   #if logger.getEffectiveLevel() < logging.INFO: 
+        #plt.scatter(bms[bms['ML_PH/Main_11kV_kW (kW)'] > 0.0]['ML_PH/Main_11kV_kW (kW)'], 
+         #           bms[bms['ML_PH/Main_11kV_kW (kW)'] > 0.0]['kVA'], 
+          #          alpha=0.05)
+        #plt.title('Power factor scatter plot.'); 
+        #plt.show()
+    
+    bms['kW_est'] = bms['kVA'] * 0.92
+    # use original values where I have them: 
+    #bms['kW_est'] = np.where(bms['kW'] == 0.0, bms['kW_est'], bms['kW'])
+    return bms
+
+```
+
+not sure I need this one anymore!
+
+```{python}
+#replace zero's with previous year values
+def replace_zeros(bms,bms_lastyear):
+    #replace year in timestamp
+    bms_lastyear_copy = bms_lastyear.reindex(bms.index, method='nearest')
+    
+    imputed_df = bms.where(bms['kVA'] == 0 | bms['kVA'].isna(), bms_lastyear_copy['kVA'],axis=0)
+    return imputed_df
+```
+
+# load the data
+
+```{python}
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+import pytz
+import logging
+```
+
+```{python}
+os.path.abspath(os.curdir)
+```
+
+```{python}
+# Change file_path as necessary
+file_path = "../Relevant data/Capstone" 
+file_path = "C:\\Users\\ciroccol\\Dropbox\\_repo\\Relevant data\\Capstone"
+
+os.chdir(file_path)
+```
+
+```{python}
+tz = pytz.timezone('Australia/Adelaide')
+```
+
+```{python}
+bms_all_safe = pd.read_excel("PH-30min-SafeCopy.xlsx", sheet_name=None)
+for k in ['b', 'c', 'Sheet1']: del bms_all_safe[k]
+```
+
+```{python}
+bms_all = bms_all_safe.copy()
+bms_complete = pd.DataFrame()
+for k in bms_all.keys():
+    bms_all[k] = bms_all[k]
+    bms_all[k] = bms_all[k][:-3]
+    bms_all[k] = bms_all[k].drop_duplicates(subset='timestamp', keep='first')
+    
+    bms_all[k].set_index('timestamp', drop=True, append=False, inplace=True, verify_integrity=False)
+    bms_all[k].index = pd.to_datetime( bms_all[k].index, infer_datetime_format=True)
+    
+    bms_all[k].rename(columns={'ML_PH/Main_11kV_kW (kW)':'kW',
+                               'ML_PH/Main_11kV_kVA (kVA)':'kVA',
+                               'ML_PH/PH_Ambient_Temperature (Â°C)':'Temp',
+                               'ML_PH/PH_Ambient_Humidity (%RH)':'Humidity'}, inplace=True)
+    bms_all[k]['kW'] =  bms_all[k]['kW'].where( bms_all[k]['kW']!=0.0,   bms_all[k]['kVA'] * 0.92)
+    bms_all[k]['Humidity'] =  bms_all[k]['Humidity'].where( bms_all[k]['Humidity']<=100.0,  100.0)
+#     bms_all[k]['Type_of_day'] = ['Weekday' if x.weekday() <= 4 else 'Weekend' for x in bms_all[k].index]
+    bms_all[k]['Type_of_day'] = [identify_type_of_day(x) for x in bms_all[k].index]
+    
+    
+    bms_complete = bms_complete.append(bms_all[k][['kW', 'kVA', 'Temp', 'Humidity', 'Type_of_day']])
+                              
+    bms_all[k][['kW', 'kVA', 'Temp', 'Humidity']].plot.line()
+    plt.show()
+```
+
+```{python}
+bms_complete['Type_of_day'] = [identify_type_of_day(x) for x in bms_complete.index]
+```
+
+```{python}
+bms_complete.to_csv("bms_complete.csv", sep=',', encoding='utf-8')
+```
+
+## a bit of a dud!
+
+```{python}
+bms_all_1718 = pd.read_csv("BMS.csv", sep=',', encoding='ISO-8859-1')
+bms_all_1718.rename(columns={'ML_PH/Main_11kV_kW (kW)':'kW',
+                             'ML_PH/Main_11kV_kVA (kVA)':'kVA',
+                             'ML_PH/PH_Ambient_Temperature (°C)':'Temp',
+                             'ML_PH/PH_Ambient_Humidity (%RH)':'Humidity'}, inplace=True)
+```
+
+```{python}
+print('\n'.join(bms_all_1718.columns))
+```
+
+```{python}
+bms_all_1718[['Temp', 'Humidity']].plot.line()
+```
+
+
+
+# Analysis/Modeling
+Do work here
+
+```{python}
+ax = bms_complete.plot(y='kW' ,figsize=(20,10), grid=True, use_index=True)
+ax.set_ylabel("kW")
+```
+
+```{python}
+ax1 = bms_complete.loc["2017-03-04":"2017-03-26"].plot(y='kW' ,figsize=(20,10), grid=True, use_index=True)
+ax1.set_ylabel("kW")
+```
+
+```{python}
+bms_complete['Type_of_day'] = [identify_type_of_day(x) for x in bms_complete.index]
+```
+
+```{python}
+grouped_by_daytype = bms_complete.groupby(['Type_of_day'])['kW'].mean()
+grouped_by_daytype
+ax = grouped_by_daytype.plot.bar()
+ax.set_ylabel("Average daily kW")
+```
+
+```{python}
+corr_val = bms_complete[['kW', 'Temp', 'Humidity']].corr()
+print (corr_val)
+import seaborn as sns
+sns.heatmap(corr_val, 
+        xticklabels=corr_val.columns,
+        yticklabels=corr_val.columns)
+
+```
+
+```{python}
+corr_val = bms_complete[['kW', 'Temp', 'Humidity']][bms_complete.Type_of_day == 'Normal_Weekday'].reset_index().corr()
+print (corr_val)
+import seaborn as sns
+sns.heatmap(corr_val, 
+        xticklabels=corr_val.columns,
+        yticklabels=corr_val.columns)
+```
+
+```{python}
+corr_val = bms_complete[['kW', 'Temp', 'Humidity']][bms_complete.Type_of_day != 'Normal_Weekday'].reset_index().corr()
+print (corr_val)
+import seaborn as sns
+sns.heatmap(corr_val, 
+        xticklabels=corr_val.columns,
+        yticklabels=corr_val.columns)
+```
+
+# now for the fun stuff
+
+
+```{python}
+import math
+from statsmodels.tsa.stattools import acf, pacf
+import statsmodels.tsa.stattools as ts
+from statsmodels.tsa.arima_model import ARIMA
+from statsmodels.tsa.arima_model import ARMAResults
+```
+
+```{python}
+tranining_data = bms_complete["2012":"2016"].copy()
+demand = bms_complete["2012":"2016"]['kW']
+```
+
+```{python}
+plt.plot(demand)
+plt.show()
+acf_1 =  acf(demand)[1:20]
+plt.plot(acf_1)
+plt.show()
+test_df = pd.DataFrame([acf_1]).T
+test_df.columns = ['Pandas Autocorrelation']
+test_df.index += 1
+test_df.plot(kind='bar')
+pacf_1 =  pacf(demand)[1:20]
+plt.plot(pacf_1)
+plt.show()
+test_df = pd.DataFrame([pacf_1]).T
+test_df.columns = ['Pandas Partial Autocorrelation']
+test_df.index += 1
+test_df.plot(kind='bar')
+result = ts.adfuller(demand, 1)
+result
+```
+
+```{python}
+demand_matrix=demand.as_matrix()
+model = ARIMA(demand_matrix, order=(3,1,3))
+model_fit = model.fit(disp=0)
+fits = model_fit.fittedvalues
+residuals = model_fit.resid
+print(model_fit.summary())
+```
+
+```{python}
+fits = np.concatenate([[0],fits])
+```
+
+```{python}
+tranining_data['fits'] = tranining_data['kW'] + fits
+```
+
+```{python}
+tranining_data['err'] = fits
+```
+
+```{python}
+tranining_data.loc["2015-03-04":"2015-03-26"].plot(y=['kW','fits', 'err'] ,figsize=(20,10), grid=True, use_index=True, legend=True)
+```
+
+```{python}
+#ARIMAX model
+arimax_model=ARIMA(endog=tranining_data[['kW']],exog=tranining_data[['Temp','Humidity']],order=[3,1,3])
+results3=arimax_model.fit()
+print(results3.summary())
+```
+
+# Results
+Show graphs and stats here
+
+
+# Conclusions and Next Steps
+Summarize findings here
+
+```{python}
+
+```

@@ -1,0 +1,459 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+import datetime as dt
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import pandas as pd
+import statsmodels.api as sm
+
+# %matplotlib inline
+```
+
+```{python}
+PV_norm = pd.read_csv("..//solar_data/PV_norm.csv",parse_dates=['date_time'],index_col="date_time")
+```
+
+```{python}
+PV_norm.head()
+```
+
+```{python}
+# 12 hourly transmissivity
+PV_norm_12H = PV_norm.norm.resample('12H').mean()
+PV_norm_Q15_12H = PV_norm.norm_Q15.resample('12H').mean()
+
+# Daily transmissivity
+PV_norm_D = PV_norm.norm.resample('D').mean()
+PV_norm_Q15_D = PV_norm.norm_Q15.resample('D').mean()
+```
+
+```{python}
+# 12 hourly transmissivity - portion only
+plt.figure(figsize=(20,5))
+plt.plot(PV_norm_12H['2015-1-1':'2015-4-1']);
+```
+
+```{python}
+# Daily transmissivity - same portion
+plt.figure(figsize=(20,5))
+plt.plot(PV_norm['2015-1-1':'2015-4-1'].norm_Q15.resample('D').mean().dropna());
+```
+
+```{python}
+# Check for missing values
+PV_norm_Q15_D.isnull().sum()
+```
+
+```{python}
+# Impute missing values
+PV_norm_Q15_D = PV_norm_Q15_D['2003-03-08':]
+PV_norm_Q15_D = PV_norm_Q15_D.interpolate(method='linear')
+```
+
+```{python}
+# Check for missing values
+PV_norm_Q15_D.isnull().sum()
+```
+
+```{python}
+len(PV_norm_Q15_D)
+```
+
+### Use a grid search to find the optimal ARMA order
+
+```{python}
+from statsmodels.tsa.arima_model import ARIMA
+
+def MAE(predicted,actual):
+    return np.nanmean([np.abs(i-j) for i,j in zip(predicted,actual)])
+
+def eval_arima(X, arima_order, freq):
+    model = ARIMA(X, list(map(int,arima_order))).fit(disp=0)
+    return {'AIC':model.aic,
+            'BIC':model.bic,
+            'HQIC':model.hqic,
+            'log_likelihood':model.llf,
+           'MAE':MAE(model.fittedvalues,X)}
+```
+
+```{python}
+eval_arima(PV_norm_Q15_12H,'202','12H')
+```
+
+```{python}
+p_values = range(0,6) 
+d_values = range(0,1)
+q_values = range(0,6)
+
+evals = {}
+counter = 0
+no_combinations = len(p_values) * len(d_values) * len(q_values)
+
+for p in p_values:
+    for d in d_values:
+        for q in q_values:
+            order = str(p)+str(d)+str(q)
+            try:                
+                evals[order] = eval_arima(PV_norm_Q15_12H,order,'12H')
+            except:
+                evals[order] = np.nan
+            counter += 1
+            print(counter,'/',no_combinations,'models evaluated','(',order,')')
+```
+
+```{python}
+output = pd.DataFrame(evals).T
+```
+
+```{python}
+output[output.BIC == output.BIC.min()]
+```
+
+```{python}
+output[output.AIC == output.AIC.min()]
+```
+
+```{python}
+output
+```
+
+### Walk forward validation
+
+The model is retrained on a fixed number of the most recent previous observations at each timestep and used to predict the next timestep.
+
+```{python}
+X = PV_norm_Q15_12H
+```
+
+```{python}
+n_train = len(X) - 100
+n_records = len(X)
+
+persistence = [] # Set a baseline
+AR1_pred = []
+ARMA32_pred = []
+
+actual = []
+
+for i in range(n_train, n_records):
+    train, test = X[0:i], X[i:i+1]
+    
+    # Persistence model
+    persistence.append(train[-1]) 
+
+    # Create list of predictions by the AR1 model
+    try:
+        AR1_model_fit = ARMA(train, order=(1,0)).fit(disp=0)
+        AR1_pred.append(AR1_model_fit.forecast(1)[0][0])
+    except:
+        AR1_pred.append(np.nan) 
+    
+    # Create list of predictions by the ARMA(3,2) model
+    try:
+        ARMA32_model_fit = ARMA(train, order=(3,0)).fit(disp=0)
+        ARMA32_pred.append(ARMA32_model_fit.forecast(1)[0][0])
+    except:
+        ARMA32_pred.append(np.nan)     
+    
+    # Create list of actual observations
+    actual.append(test[0])
+```
+
+```{python}
+ARMA32_model_fit.forecast(6)[0]
+```
+
+```{python}
+plt.figure(figsize=(20,10))
+plt.plot(persistence, 'b-',label='Persistence model')
+plt.plot(ARMA_32_pred,'r-',label='ARMA (3,2) model')
+plt.plot(AR1_pred, 'c-', label='AR1 model')
+plt.plot(actual, 'g-',label='Actual values');
+```
+
+```{python}
+print ('Persistence model MAE:', MAE(persistence,actual))
+print ('AR1 model MAE:', MAE(AR1_pred, actual))
+print ('ARMA 32 model MAE:', MAE(ARMA_32_pred,actual))
+```
+
+```{python}
+len(AR1_pred)
+```
+
+```{python}
+from statsmodels.tsa.arima_model import ARMA
+
+AR3_pred = ARMA(X, order=(3,0), freq='12H')
+AR3_pred_fit = AR3_pred.fit(trend='nc',disp=0)
+AR3_pred_fit.summary()
+```
+
+```{python}
+# Mean average error for fitted model
+MAE(AR3_pred_fit.fittedvalues,X)
+```
+
+### Recreate using linear regression
+
+```{python}
+model_df = pd.concat([X.shift(-1),X.shift(-2),X.shift(-3),X], axis=1)
+model_df.columns = ['t-1','t-2','t-3','t']
+```
+
+```{python}
+model_df = model_df.dropna()
+```
+
+```{python}
+# AR3 model
+model_fit = sm.OLS(model_df['t'],model_df.iloc[:, 0:3]).fit()
+model_fit.summary()
+```
+
+The coefficients produced by the ARIMA model are very similar to those produced by the linear regression model.  The difference is perhaps due to the method of estimation, least squares vs. maximum likelihood estimation.
+
+```{python}
+list(zip(model_fit.params,AR3_pred_fit.params))
+```
+
+## Try including weather data as input to the regression model to improve result
+
+```{python}
+# Change these years as required
+from_year = 2001
+to_year = 2016
+
+year_range = range(from_year,to_year+1)
+
+weather = {}
+
+for year in year_range:      
+    weather[str(year)[-2:]] = pd.read_csv(
+        '..//weather_data/w_' + str(year) + '.csv',
+        parse_dates=['date_time'],
+        index_col='date_time')
+```
+
+```{python}
+# Years for which (some) data is present
+yrs = weather.keys()
+yrs
+```
+
+```{python}
+# Merge dictionary of dataframes into a single dataframe
+weather = pd.concat(weather.values())
+weather.head()
+```
+
+```{python}
+weather.tail()
+```
+
+```{python}
+
+```
+
+```{python}
+# Drop unused columns
+use_cols = ['temp','wb_temp','dp_temp','rel_humid','wind_spd','visibility','sea_lvl_pressure']
+weather = weather[use_cols]
+```
+
+```{python}
+# Merge solar and weather dataframes into a single dataframe
+data = pd.concat([PV_norm,weather], axis=1, join='inner')
+```
+
+```{python}
+data.columns
+```
+
+```{python}
+data.head()
+```
+
+```{python}
+# Check for correlations between lagged values of normalised solar power and weather variables
+lagged_norm = pd.concat([data.norm_Q15.shift(1),data.norm_Q15.shift(2),data.norm_Q15.shift(3)], axis=1)
+```
+
+```{python}
+lagged_norm.columns = ['t-1','t-2','t-3']
+```
+
+```{python}
+data = pd.concat([lagged_norm,data], axis=1)
+```
+
+```{python}
+data.dropna().corr().loc[weather.columns,lagged_norm.columns]
+```
+
+There appears to be weak relationships between lagged normalised solar power and temperature, humidity, and sea level pressure.  The Granger-Causality test can also be used to find if humidity 'Granger-causes' changes in solar transmissivity.
+
+```{python}
+print(sm.tsa.stattools.grangercausalitytests(data[['norm_Q15','temp']].dropna(),5))
+```
+
+```{python}
+ARMAX_data = data[['norm_Q15', 'temp', 'rel_humid', 'sea_lvl_pressure']]
+
+
+# Resample to be 12-hourly
+ARMAX_data = ARMAX_data.resample('D').mean()
+
+# Create new features - change in weather variables
+ARMAX_data['temp_change'] = ARMAX_data['temp'] - ARMAX_data['temp'].shift(1)
+
+# Drop missing values
+ARMAX_data = ARMAX_data.dropna()
+
+Y = ARMAX_data.norm_Q15.values
+X = ARMAX_data[['temp','sea_lvl_pressure']].values
+```
+
+```{python}
+from statsmodels.tsa.arima_model import ARMA
+
+AR1X_pred = ARMA(endog=Y, exog=X, order=(2,0))
+AR1X_pred_fit = AR1X_pred.fit(trend='nc',disp=0)
+AR1X_pred_fit.summary()
+```
+
+```{python}
+x = AR1X_pred.fit()
+```
+
+```{python}
+np.array([X[-1],X[-1]])
+```
+
+```{python}
+x.forecast(3, exog=np.array([X[-1],X[-1],X[-1]]))[0]
+```
+
+Walk forward validation
+
+```{python}
+import winsound
+```
+
+```{python}
+n_train = len(ARMAX_data) - 200
+n_records = len(ARMAX_data)
+
+persistence = [] # Set a baseline
+AR1X_pred = []
+
+actual = []
+
+for i in range(n_train, n_records):
+    train, test = ARMAX_data.iloc[0:i], ARMAX_data.iloc[i:i+1]
+    
+    Y = train.norm_Q15.values
+    X = train[['temp','sea_lvl_pressure']].values
+    
+    # Persistence model
+    persistence.append(Y[-1]) 
+
+    # Create list of predictions by the AR2 model
+    try:
+        AR1X_model_fit = ARMA(endog=Y, exog=X, order=(2,0)).fit(disp=0)
+        AR1X_pred.append(AR1X_model_fit.forecast(3, exog=np.array([X[-1],X[-1],X[-1]]))[0])
+    except:
+        AR1X_pred.append(np.nan) 
+    
+    # Create list of actual observations
+    actual.append(test.norm_Q15.values[0])
+
+winsound.Beep(500,100)
+```
+
+```{python}
+AR1X_pred = pd.DataFrame(AR1X_pred, columns=['pred_t+1','pred_t+2','pred_t+3'])
+```
+
+```{python}
+AR1X_pred['actual_t+1'] = actual
+AR1X_pred['actual_t+2'] = AR1X_pred['actual_t+1'].shift(-1)
+AR1X_pred['actual_t+3'] = AR1X_pred['actual_t+1'].shift(-2)
+AR1X_pred = AR1X_pred.dropna()
+```
+
+```{python}
+MAE_1 = MAE(AR1X_pred['pred_t+1'], AR1X_pred['actual_t+1'])
+MAE_2 = MAE(AR1X_pred['pred_t+2'], AR1X_pred['actual_t+2'])
+MAE_3 = MAE(AR1X_pred['pred_t+3'], AR1X_pred['actual_t+3'])
+
+print('Mean Average Error - 1 day ahead forecast: {0:%}'.format(MAE_1))
+print('Mean Average Error - 2 day ahead forecast: {0:%}'.format(MAE_2))
+print('Mean Average Error - 3 day ahead forecast: {0:%}'.format(MAE_3))
+```
+
+```{python}
+MAE_1_persistence = MAE(persistence,AR1X_pred['actual_t+1'])
+MAE_2_persistence = MAE(persistence,AR1X_pred['actual_t+2'])
+MAE_3_persistence = MAE(persistence,AR1X_pred['actual_t+3'])
+
+print('Mean Average Error - Persistence model - 1 day ahead: {0:%}'.format(MAE_1_persistence))
+print('Mean Average Error - Persistence model - 2 day ahead: {0:%}'.format(MAE_2_persistence))
+print('Mean Average Error - Persistence model - 3 day ahead: {0:%}'.format(MAE_3_persistence))
+```
+
+```{python}
+MAE_1_impr = (MAE_1_persistence - MAE_1) / MAE_1_persistence
+MAE_2_impr = (MAE_2_persistence - MAE_2) / MAE_2_persistence
+MAE_3_impr = (MAE_3_persistence - MAE_3) / MAE_3_persistence
+
+print('Improvement over persistence model - 1 day ahead: {0:%}'.format(MAE_1_impr))
+print('Improvement over persistence model - 2 day ahead: {0:%}'.format(MAE_2_impr))
+print('Improvement over persistence model - 3 day ahead: {0:%}'.format(MAE_3_impr))
+```
+
+```{python}
+plt.close()
+plt.figure(figsize=(20,10))
+#plt.plot(persistence, 'b-',label='Persistence model', alpha=0.2)
+plt.plot(AR1X_pred,'r-',label='ARMA 1,2 model')
+plt.plot(actual, 'b-',label='Actual values');
+```
+
+### Replicate the AR1X model using regression
+
+```{python}
+ARMAX_data.columns
+```
+
+```{python}
+ARMAX_data['norm_Q15_t1'] = ARMAX_data['norm_Q15'].shift(1)
+ARMAX_data['norm_Q15_t2'] = ARMAX_data['norm_Q15'].shift(2)
+```
+
+```{python}
+ARMAX_data = ARMAX_data.dropna()
+```
+
+```{python}
+Y = ARMAX_data['norm_Q15']
+X = ARMAX_data[['temp','sea_lvl_pressure','norm_Q15_t1','norm_Q15_t2']]
+```
+
+```{python}
+sm.OLS(Y,X).fit().summary()
+```

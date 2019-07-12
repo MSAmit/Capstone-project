@@ -1,0 +1,1044 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+## Purpose of module
+
+This module uses the technique described in 'Online short-term solar forecasting' by Bacher P, Madsen H & Nielsen HA (2009) to normalise the mean direct horizontal radiation by dividing by a clear sky model, created by smoothing the data in two dimensions; day of the year and hour of the day. 
+
+
+## Import modules and load data
+
+```{python}
+import datetime as dt
+import json
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D
+import operator
+import scipy
+from scipy.optimize import minimize
+from scipy.optimize import curve_fit
+from scipy.spatial import distance
+from scipy.stats import multivariate_normal
+from scipy import asarray as ar,exp
+import numpy as np
+import os
+import pandas as pd
+import patsy
+import pylab as plb
+import pytz
+import rpy2
+import statsmodels.formula.api as smf
+from statsmodels.regression.quantile_regression import QuantReg
+
+# %matplotlib inline
+# %load_ext rpy2.ipython
+```
+
+Create dictionary of dataframes corresponding to each year specified below:
+
+```{python}
+# Change these years as required
+from_year = 2015
+to_year = 2017
+
+year_range = range(from_year,to_year+1)
+
+PV = {}
+
+for year in year_range:      
+    PV[str(year)[-2:]] = pd.read_csv(
+        '..//solar_data/PV_' + str(year) + '.csv',
+        parse_dates=['date_time'],
+        index_col='date_time')
+```
+
+Drop all columns except those specified in `use_cols`
+
+```{python}
+use_cols = ['mean_dir_horiz','mean_diffuse']
+PV.update({k:v[use_cols] for k,v in PV.items()})
+```
+
+Create a new variable in each dataframe, `GHI`, which is the sum of the remaining variables; `mean_dir_horiz` and `mean_diffuse`.
+
+```{python}
+for k,v in PV.items():
+    v['GHI'] = v['mean_dir_horiz'] + v['mean_diffuse']
+```
+
+### Initial data investigation
+
+
+Insert a plot here showing movement in the data
+
+```{python}
+
+```
+
+View first few records
+
+```{python}
+for k,v in PV.items():
+    print(v.head())
+```
+
+As expected, the time series is at 1 minute intervals. What is the range of each year's data?
+
+```{python}
+for k,v in PV.items():
+    print('20'+k,' ->  from:',v.iloc[0].name,'to:',v.iloc[-1].name)
+```
+
+Check for missing data (where there is a timestamp but no measurement of `mean_dir_horiz`, `mean_diffuse` or `GHI`). 
+
+```{python}
+for k,v in PV.items():
+    print('20'+k,'missing values')
+    print(np.isnan(v).sum(),'\n')
+```
+
+There are missing measurements in every year.  Now, we check for duplicate timestamps:
+
+```{python}
+for k,v in PV.items():
+    print('20'+k,v.index.duplicated().sum())
+```
+
+The absence of duplicate timestamps indicates that although the time is local, daylight savings time is ignored.
+
+Check for continuity in the time series
+
+```{python}
+# Function for better viewing comparisons between years
+def stacked_years(lst):
+    return(json.dumps(dict(zip(year_range,lst)), indent=0)[2:-2])
+```
+
+```{python}
+# How many minutes should there be in each year if there are continuous minute timestamps
+# between the minimum and maximum in each year?
+def expected_minutes():
+    return([int((v.iloc[-1].name - v.iloc[0].name).total_seconds() / 60 + 1) for k,v in PV.items()])
+
+print(stacked_years(expected_minutes()))
+```
+
+```{python}
+# How many timestamps are there actually in the datasets?
+def actual_minutes():
+    return([len(v) for k,v in PV.items()])
+
+print(stacked_years(actual_minutes()))
+```
+
+```{python}
+# How many timestamps are missing throughout each year
+def missing_timestamps():      
+    return(map(operator.sub, expected_minutes(), actual_minutes()))
+
+print(stacked_years(missing_timestamps()))
+```
+
+There are periods of time for which no data exists at all in the datasets (not just no relevant measurements recorded).
+
+
+## Deal with missing data
+
+(A plot would be useful here to visualise when data is missing)
+
+
+How should we deal with missing data here?  The data is being used to fit a regression plane.  
+
+* Setting missing values to zero would distort the regression coefficients.
+* Imputing missing values require a regression plane (chicken and egg problem).
+* Replacing with the mean/median would also distort the regression coefficients (reduce variance).
+* Deleting missing values means we can no longer neatly pack the data into an $x$ (day of year) by $y$ (time of day) array to calculate the objective function.
+* Can we just leave missing values in for the time being? After packing the data into an $x$ by $y$ array, $z$ (actual solar power at the corresponding value of $x$ and $y$) will have missing data at some points, but $\hat z$ will not. Our objective/loss function then ignore those points on the $x$ by $y$ grid where there are missing values for $z$.
+
+Lui suggested replacement of missing values with the same time and date from the prior year.
+
+
+#### Data transformation
+
+Firstly, each dataset is treated by resampling the time series on the same frequency (1 minute).  Any gaps will be added as time stamps and filled with `NaN`s.
+
+```{python}
+PV.update({k:v.resample('T').mean() for k,v in PV.items()})
+```
+
+This has created continuous time series for each years' data.
+
+```{python}
+print(stacked_years(missing_timestamps()))
+```
+
+But since each added timestamp has missing data, the total number of missing values has increased.
+
+```{python}
+for k,v in PV.items():
+    print('20'+k,'missing values')
+    print(np.isnan(v).sum(),'\n')
+```
+
+Missing values in each dataset are replaced with the values in corresponding times and dates each year.
+
+```{python}
+# Return the indices of the supplied dataframe for which the supplied column name(s) have any missing data
+def missing(df,colnames):
+    return df[np.isnan(df[colnames]) == True].index
+```
+
+```{python}
+# Takes a DatetimeIndex as input and returns the same offset by specified number of years
+def change_year(dates, yrs):
+    return dates + pd.DateOffset(years=yrs)
+```
+
+```{python}
+# Takes a dataframe with a DatetimeIndex as input and returns same df with index 
+# adjusted by specified number of years
+def change_year(df, yrs):
+    dates = df.index
+    return dates + pd.DateOffset(years=yrs)
+```
+
+__To do__
+
+Use np.roll to create a 'circular list' so each element that rolls backwards beyond the first position references the last.
+
+Every dataframe in the dictionary can then have a reference to impute missing values from another dataframe.
+
+```{python}
+missing_17 = PV['17'].loc[missing(PV['17'],'GHI'),:]
+```
+
+```{python}
+replacements = PV['16'].loc[change_year(missing_17,-1),:]
+replacements.index = missing_17.index
+```
+
+```{python}
+PV['17'].loc[missing(PV['17'],'GHI'),:] = replacements
+```
+
+```{python}
+for k,v in PV.items():
+    print('20'+k,'missing values')
+    print(np.isnan(v).sum(),'\n')
+```
+
+There are still some missing values, which are replaced by values from the corresponding time/date two years previously.
+
+```{python}
+missing_17 = PV['17'].loc[missing(PV['17'],'GHI'),:]
+replacements = PV['15'].loc[change_year(missing_17,-2),:]
+replacements.index = missing_17.index
+PV['17'].loc[missing(PV['17'],'GHI'),:] = replacements
+```
+
+```{python}
+for k,v in PV.items():
+    print('20'+k,'missing values')
+    print(np.isnan(v).sum(),'\n')
+```
+
+### Resample from 1 minute frequency to 15 minute frequency to speed up calculation times
+
+```{python}
+PV_15M = {k:v.resample('15T').mean() for k,v in PV.items()}
+```
+
+```{python}
+PV_15M['17'].head()
+```
+
+## Create new variables for analysis
+
+
+Add time of day (in minutes from midnight at the start of each day):
+
+```{python}
+def time_of_day(dt_index):
+    date_time = dt_index.combine(dt_index.date(),dt_index.time())
+    start_of_day = dt_index.combine(dt_index.date(),dt.time(0,0))
+    return (date_time - start_of_day).total_seconds() / 60 + 1
+```
+
+```{python}
+PV_15M['17'].index.map(time_of_day)
+```
+
+```{python}
+for k,v in PV_15M.items():
+    v['time_of_day'] = v.index.map(time_of_day)
+```
+
+Add number of days after 1 January in each year.
+
+```{python}
+def day_of_year(dt_index):
+    first_day_of_year = dt.date(dt_index.year,1,1)
+    return float((dt_index.date() - first_day_of_year).days + 1)
+```
+
+```{python}
+for k,v in PV_15M.items():
+    v['day_of_year'] = v.index.map(day_of_year)
+```
+
+```{python}
+PV_15M['16'].head()
+```
+
+Bacher, Madsen and Nielsen recommend fitting $z$ (clear sky solar power) to the $q^{th}$ quantile of a normal distribution in two dimensions to the data ($x$ = day of year and $y$ = time of day) to create a clear sky model. The normal distribution is centred around zero, hence we have done the same to our regressors, as follows.
+
+Let each (solar) year be delimited by winter solstices, so the summer solstice falls in the middle of each year. Within each year, define `summer_solstice_delta` as the distance, in days, from the summer solstice.
+
+```{python}
+winter_solstice = (6,21) # 21 June
+summer_solstice = (12,22) # 22 December
+```
+
+```{python}
+def summer_solstice_delta(dt_index):
+    # Is date in last solar year?
+    if dt_index.date() < dt.date(dt_index.year,*winter_solstice): 
+        # If so, return delta from last year's summer solstice
+        return (dt.date(dt_index.year-1,*summer_solstice) - dt_index.date()).days 
+    else:
+        # Otherwise return delta from this year's summer solstice
+        return float((dt.date(dt_index.year,*summer_solstice) - dt_index.date()).days) 
+```
+
+```{python}
+for k,v in PV_15M.items():
+    v['summer_solstice_delta'] = v.index.map(summer_solstice_delta)
+```
+
+Similarly, define `midday_delta` as the distance, in minutes, from midday each day.
+
+```{python}
+def midday_delta(time_of_day):
+    return time_of_day - 12*60-1
+
+#PV17_15M['midday_delta'] = midday_delta(PV17_15M.time_of_day)
+```
+
+```{python}
+for k,v in PV_15M.items():
+    v['midday_delta'] = midday_delta(v['time_of_day'])
+```
+
+```{python}
+PV_15M['17'].head()
+```
+
+### Visualise dataset
+
+```{python}
+# Plot distribution of solar output by minute of the day and day of the year
+fig = plt.figure(figsize=(20,20))
+ax = plt.axes(projection='3d')
+ax.scatter(PV_15M['17'].day_of_year, PV_15M['17'].time_of_day, PV_15M['17'].GHI, 
+                c=PV_15M['17'].GHI, linewidth=0.005)
+ax.text2D(0.05, 0.95,
+          'Mean direct horizontal solar radiation measured by the Bureau of Meteorology at Adelaide Airport throughout 2017',
+          transform=ax.transAxes, fontsize=15)
+ax.set_xlabel('Days since the start of the year')
+ax.set_ylabel('Minutes since start of the day')
+ax.set_zlabel('Mean Direct Horizontal Irradiance (Watts)')
+plt.show()
+```
+
+__Observations__
+
+* Some points sit well above the surface, likely due to the effect described by Luigi Cirocco and John Boland where reflection and magnification by cloud creates solar power above the 'clear sky solar power'.
+* Otherwise, the data distribution is as expected.
+
+```{python}
+# Plot distribution of solar output by minute of the day and day of the year
+fig = plt.figure(figsize=(20,20))
+ax = plt.axes(projection='3d')
+ax.scatter(PV_15M['17'].summer_solstice_delta, PV_15M['17'].midday_delta, PV_15M['17'].GHI, 
+                c=PV_15M['17'].GHI, linewidth=0.005)
+ax.text2D(0.05, 0.95,
+          'Mean direct horizontal solar radiation measured by the Bureau of Meteorology at Adelaide Airport throughout 2017',
+          transform=ax.transAxes, fontsize=15)
+ax.set_xlabel('Days to/from summer solstice in each solar year')
+ax.set_ylabel('Minutes to/from midday each day')
+ax.set_zlabel('Mean Direct Horizontal Irradiance (Watts)')
+plt.show()
+```
+
+__Observations:__
+
+* Maximum solar power appears to consistently peak later than midday. Should we change the variable to reflect distance from the peak? - __No, model seems to work OK as long as the peak does not overlap the bounds each day or year.__
+* Using a normal distribution to model changes in solar power by the day of the year, the tails appear to approach approximately 450 watts at the winter solstices, rather than zero (as might occur in the upper northern hemisphere). Does this make the normal distribution a poor fit to our data? - __When regressing to the mean, this does seem to lead to a poor fit for the data.  Hopefully regression to the $q^{th}$ percentile will fix this.__
+
+
+## Calculate 'clear sky' prediction of solar radiation at each minute of each day
+
+
+Appendix A of 'Online short-term solar power forecasting' by Bache, Madsen & Nielsen, published in Solar Energy, Volume 83 (2009), pp.1772-1783, describes a method for calculating estimated clear sky solar power $\hat{p}_{t}^{cs}$ given a solar power time series $p_t$, $t=1$,...,$N$, found as the $q$ quantile of ${ {f}_{P} }_{t}$, which is the probability distribution function of $P_t$.  This should be a smooth function intersecting the maximums of the actual values $p_i$ on the diagram above.
+
+The problem is reduced to estimating $\hat{p}_{t}^{cs}$ as a local constant for each $(x_t,y_t)$, where $x$ is the days since the start of the year and $y$ is the number of minutes since the start of the day.  
+
+
+The loss function $\rho(q,\epsilon_i$) is:
+
+\begin{equation*}
+\rho(q,\epsilon_i) =
+\begin{cases}
+    q\epsilon_i ,\quad \quad \quad \epsilon_i >= 0,  \\
+    (1 - q)\epsilon_i ,\quad \epsilon_i < 0, \\
+\end{cases}
+\end{equation*}
+
+where:
+
+\begin{equation*}
+\epsilon_i = p_i - \hat{p}_{t}^{cs}
+\end{equation*}
+
+
+The fitting is done by:
+
+\begin{equation*}
+\underset{\hat{p}_{t}^{cs}}{\operatorname{arg min}} = \sum_{i=1}^N k(x_t,y_t,x_i,y_i)\cdot \rho(q,\epsilon_i),
+\end{equation*}
+
+where:
+
+\begin{equation*}
+k(x_t,y_t,x_i,y_i) = \frac{w(x_t,x_i,h_x)\cdot w(y_t,y_i,h_y)}{\sum_{i=1}^N w(x_t,x_i,h_x)\cdot w(y_t,y_i,h_y)}
+\end{equation*}
+
+is the two-dimensional multiplicative kernel function which weights the observations locally to $(x_t,y_t)$, following Hastie & Tibshirani's 'Varying-Coefficient Models' published in the Journal of the Royal Statistical Society. Series B (Methodological), Vol. 55, No. 4 (1993), pp. 757-796.
+
+
+In each dimension a Gaussian kernel is used
+
+\begin{equation*}
+w(x_t,x_i,h_x) = f_{std}\left(\frac{\left|{x_t-x_i}\right|}{h_x}\right),
+\end{equation*}
+
+where $f_{std}$ is the standard normal probability density function. A similar kernel function is used in the $y$ dimension and the final two-dimensional kernel is found by multiplying the two kernels.
+
+
+### Pack the (X) time of day and (Y) days since winter solstice variables into a single 3D array
+
+
+The following method easily creates arrays for the predictor variables; `summer_solstice_delta` and `midday_delta`.
+
+```{python}
+X, Y = np.meshgrid(np.unique(PV_15M['17'].midday_delta.values),
+                   np.unique(PV_15M['17'].summer_solstice_delta.values).astype(float))
+```
+
+```{python}
+iterables = [list(np.unique(PV_15M['17'].summer_solstice_delta.values).astype(float)),
+             list(np.unique(PV_15M['17'].midday_delta.values))]
+```
+
+Groupby approach to create a Series of GHI values with a multi-index with two levels - (1) `summer_solstice_delta` and (2) `midday_delta`
+
+```{python}
+a = PV_15M['17'].groupby(['summer_solstice_delta','midday_delta'])['GHI']
+```
+
+```{python}
+Z = np.array(a.first().unstack()).T
+```
+
+```{python}
+Z.shape
+```
+
+Visualise solar power output (GHI) after recentering the year to be at the summer solstice.
+
+```{python}
+# Changes i15 minute solar power throughout the year 
+plt.plot(Z);
+```
+
+```{python}
+# Daily solar power throughout the day varying throughout the year
+plt.plot(Z.T);
+```
+
+### Fit the normal distribution with one predictor variable (time of day)
+
+```{python}
+# One sunny day's actual data
+y = Z[:,150]
+```
+
+```{python}
+x = ar(range(len(y)))
+```
+
+```{python}
+plt.plot(y);
+```
+
+```{python}
+mean = sum(x * y)/sum(y)
+sigma = np.sqrt(sum(y * (x - mean)**2)/sum(y))
+```
+
+```{python}
+def gaus(x,a,x0,sigma):
+    return a * np.exp( -(x-x0)**2 / (2 * sigma**2))
+```
+
+```{python}
+popt,pcov = curve_fit(gaus,x,y,p0=[1,mean,sigma])
+```
+
+```{python}
+plt.plot(x, y, 'b+:', label='data')
+plt.plot(x, gaus(x, *popt), 'r-', label='fit')
+plt.legend()
+plt.show;
+```
+
+Would a censored regression model be a better fit?
+
+
+### Create sample dataset for analysis in R
+
+```{python}
+#PV17_15M[['GHI','summer_solstice_delta','midday_delta']].to_csv('..//solar_data//PV_2017_processed.csv')
+```
+
+### Now expand to fit normal distribution in two dimensions
+
+
+Function for 2D gaussian curve fitting taken from [here](https://stackoverflow.com/questions/21566379/fitting-a-2d-gaussian-function-using-scipy-optimize-curve-fit-valueerror-and-m).
+
+```{python}
+def twoD_gaus(xdata_tuple, amplitude, x0, y0, sigma_x, sigma_y, theta, offset):
+    (x, y) = xdata_tuple
+    x0 = float(x0)
+    y0 = float(y0)
+    a = (np.cos(theta)**2)/(2*sigma_x**2) + (np.sin(theta)**2)/(2*sigma_y**2)
+    b = -(np.sin(2*theta))/(4*sigma_x**2) + (np.sin(2*theta))/(4*sigma_y**2)
+    c = (np.sin(theta)**2)/(2*sigma_x**2) + (np.cos(theta)**2)/(2*sigma_y**2)
+    g = offset + amplitude*np.exp( - (a*((x-x0)**2) + 2*b*(x-x0)*(y-y0)
+                                     + c*((y-y0)**2)))
+    return g.ravel()
+```
+
+```{python}
+x, y = np.meshgrid(np.unique(PV_15M['17'].summer_solstice_delta.values),np.unique(PV_15M['17'].midday_delta.values))
+```
+
+```{python}
+# Replace missing values in Z with zero
+Z = np.nan_to_num(Z,0)
+```
+
+```{python}
+initial_guess = (3,100,100,20,40,0,10)
+```
+
+```{python}
+popt, pcov = curve_fit(
+    twoD_gaus, (x,y), Z.ravel(), p0 = initial_guess, maxfev = 1000000)
+```
+
+```{python}
+data_fitted = twoD_gaus((x,y), *popt)
+
+fig = plt.figure(figsize=(10,10))
+ax = plt.axes()
+ax.imshow(Z, cmap=plt.cm.jet,
+          extent=(x.min(), x.max(), y.min(), y.max()))
+ax.contour(x,y,data_fitted.T.reshape(96,365))
+plt.show();
+```
+
+```{python}
+# Plot distribution of solar output by minute of the day and day of the year
+fig = plt.figure(figsize=(20,20))
+ax = plt.axes(projection='3d')
+ax.scatter(x, y, Z, c=data_fitted, cmap=('viridis'), alpha=0.4, label='Observed')
+ax.plot_wireframe(x, y, data_fitted.reshape(96,365), color='black', linewidth=2, label='Model for mean')
+ax.text2D(0.05, 0.95,
+          'Mean direct horizontal solar radiation measured by the Bureau of Meteorology at Adelaide Airport throughout 2017',
+          transform=ax.transAxes, fontsize=15)
+ax.set_xlabel('Days to/from summer solstice in each solar year')
+ax.set_ylabel('Minutes to/from midday each day')
+ax.set_zlabel('Mean Global Horizontal Irradiance (Watts)')
+#ax.view_init(15,45)
+plt.legend()
+plt.show()
+```
+
+### R solution to obtain quantile regression fits of bivariate normal distribution.
+
+```{python}
+df1 = PV_15M['17'][['GHI','summer_solstice_delta','midday_delta']]
+```
+
+```{r magic_args='-i df1 -o y_hat_55'}
+
+packages <- c('mvtnorm','quantreg')
+
+install.packages(c('mvtnorm','quantreg'))
+library(mvtnorm)
+library(quantreg)
+
+y <- df1$GHI
+x <- as.matrix(df1[c('summer_solstice_delta','midday_delta')])
+
+Dat <- list(y=y,x=x)
+
+norm_quart_fit <- function(x,intercept,scale,mu_1,mu_2,sig_1,sig_2,cov_x1x2){
+  x = as.matrix(x)
+  mu <- c(mu_1,mu_2)
+  sigma <- matrix(c(sig_1,cov_x1x2,cov_x1x2,sig_2),nrow=2,ncol=2,byrow=TRUE)
+  return(intercept + scale * dmvnorm(x=x,mean=mu,sigma=sigma))
+}
+
+guess <- c(intercept=0, scale=5e5, mu_1=20, mu_2=10, sig_1=800, sig_2=1000, cov_x1x2=20)
+mod_55 <- nlrq(y ~ norm_quart_fit(x,intercept,scale,mu_1,mu_2,sig_1,sig_2,cov_x1x2), 
+               data=Dat, start=guess, tau=0.55)
+
+y_hat_55 <- predict(mod_55,Dat$y)
+#fit_coeffs = mod_85$m$getAllPars()
+```
+
+```{python}
+y_hat_55 = np.array(y_hat_55)
+```
+
+```{python}
+plt.plot(df1.GHI[2500:3000]);
+```
+
+```{python}
+plt.plot(y_hat_55[2500:3000]);
+```
+
+```{python}
+plt.plot(y_hat_55[2000:3000]/df1.GHI[2000:3000]);
+```
+
+```{python}
+plt.plot(df1.GHI);
+```
+
+```{python}
+plt.plot(y_hat_55);
+```
+
+### Build quantile regression model predicting GHI from the number of minutes after the start of the day - based on __[the examples in the documentation](https://www.statsmodels.org/dev/examples/notebooks/generated/quantile_regression.html)__
+
+
+Is it possible to adapt this module's output, suited to linear regression (intercept, $\beta_1, \beta_2, ...$) to provide the parameters for a bivariate Gaussian distribution?
+
+The input requires an R-style formula using the `patsy` module.  In this notation, a linear regression formula looks something like:
+
+`GHI ~ <term 1> + <term 2>`
+
+where each term is an interaction between one or more factors. Each term is assigned a coefficient by the quantile regression module, so each will need to be a parameter of the bivariate Gaussian function.
+
+
+
+```{python}
+x = PV_15M.summer_solstice_delta.values
+y = PV_15M.midday_delta.values
+
+x_unique = np.unique(x)
+y_unique = np.unique(y)
+
+mu_x = np.mean(x)
+mu_y = np.mean(y)
+
+mean = np.array([mu_x,mu_y])
+mean
+```
+
+```{python}
+cov = np.sqrt(np.cov(x,y))
+cov
+```
+
+### Create a design matrix here to feed into the patsy formula?? See [this link](https://stackoverflow.com/questions/45058690/when-using-scipy-stats-multivariate-normal-pdf-having-the-erroroperands-could-n)
+
+```{python}
+X, Y = np.meshgrid(np.unique(PV_15M.summer_solstice_delta.values),
+    np.unique(PV_15M.midday_delta.values))
+pos = np.empty(X.shape + (2,))
+pos[:, :, 0] = X ; pos[:, :, 1] = Y
+Zhat = multivariate_normal.pdf(pos,mean,sigma)
+```
+
+```{python}
+Y[:,0]
+```
+
+```{python}
+Z.shape
+```
+
+```{python}
+
+```
+
+```{python}
+plt.plot(multivariate_normal.pdf(pos, mean=mean, cov=sigma));
+```
+
+```{python}
+
+```
+
+```{python}
+df = PV_15M[['GHI','summer_solstice_delta','midday_delta']]
+df = df.fillna(0)
+```
+
+```{python}
+
+```
+
+```{python}
+#mod = smf.quantreg('GHI ~ multivariate_normal.pdf((x,y), mean, sigma)', PV_15M)
+```
+
+```{python}
+mod = smf.quantreg('GHI ~ twoD_gaus((x, y), *popt)', PV_15M)
+```
+
+```{python}
+fit = mod.fit(q=0.85)
+```
+
+```{python}
+fit.summary()
+```
+
+```{python}
+Zhat.shape
+```
+
+How can I convert this formula for the bivariate normal distribution probability density function:
+
+
+\begin{equation*}
+{\displaystyle f(x,y)={\frac {1}{2\pi \sigma _{X}\sigma _{Y}{\sqrt {1-\rho ^{2}}}}}\exp \left(-{\frac {1}{2(1-\rho ^{2})}}\left[{\frac {(x-\mu _{X})^{2}}{\sigma _{X}^{2}}}+{\frac {(y-\mu _{Y})^{2}}{\sigma _{Y}^{2}}}-{\frac {2\rho (x-\mu _{X})(y-\mu _{Y})}{\sigma _{X}\sigma _{Y}}}\right]\right)}
+\end{equation*}
+
+where $\rho$ is the correlation between $X$ and $Y$ and where $\sigma_X > 0$ and $\sigma_Y > 0$, in this case:
+
+\begin{equation*}
+{\mu }={\begin{pmatrix}\mu _{X}\\\mu _{Y}\end{pmatrix}},\quad {\Sigma }={\begin{pmatrix}\sigma _{X}^{2}&\rho \sigma _{X}\sigma _{Y}\\\rho \sigma _{X}\sigma _{Y}&\sigma _{Y}^{2}\end{pmatrix}}.
+\end{equation*}
+
+
+into a multiple linear regression format, where:
+
+\begin{equation*}
+f(x,y) = \beta_0 + \beta_1(\ldots) + \beta_2(\ldots) + \beta_3(\ldots) + \beta_4(\ldots) + \beta_5(\ldots)
+\end{equation*}
+
+where:
+\begin{equation*}
+\beta_1 = \mu_X;
+\beta_2 = \mu_Y; 
+\beta_3 = \sigma^2_X; 
+\beta_4 = \sigma^2_Y; 
+\beta_5 = \rho\sigma_X\sigma_Y
+\end{equation*}
+
+```{python}
+
+```
+
+### Attempt to use scipy.optimize.minimise to vary mu and Sigma parameters to minimise MAE between observations and bivariate Gaussian regression plane (think about quantile regression component next...)
+
+```{python}
+PV_15M.summer_solstice_delta.nunique()
+```
+
+```{python}
+PV_15M.midday_delta.nunique()
+```
+
+```{python}
+parameters = [0.4, 0.7, 6000., -.5, 18000., 5e7]
+```
+
+```{python}
+def create_Z_hat(params):
+    mu_X = params[0]
+    mu_Y = params[1]
+    mu = np.array([mu_X, mu_Y])
+    
+    sigma_1 = params[2]
+    sigma_2 = sigma_3 = params[3]
+    sigma_4 = params[4]
+    
+    scale_up = params[5]
+    
+    Sigma = np.array([[sigma_1 , sigma_2], [sigma_2,  sigma_4]])
+    model = multivariate_normal(mu, Sigma)      
+    Z_hat = model.pdf(pos) # Probability distribution function
+    Z_hat = Z_hat * scale_up # Scale up to have the same sum as Z
+    return Z_hat
+```
+
+```{python}
+Z_hat = create_Z_hat(params)
+```
+
+```{python}
+def objective(params):
+    return np.nansum(np.absolute(Z_hat - Z))
+```
+
+```{python}
+pos.shape
+```
+
+```{python}
+objective(params)
+```
+
+```{python}
+def isPSD(params, tol=1e-8):
+  E,V = scipy.linalg.eigvalsh(np.matrix(params[2:6]).reshape(2,2))
+  return np.all(E > -tol)
+```
+
+```{python}
+def constraint(params):
+    return isPSD(params) + 1
+```
+
+```{python}
+cons = {'type':'eq', 'fun': constraint}
+```
+
+```{python}
+isPSD(params)
+```
+
+```{python}
+solution = minimize(fun=objective,x0=params)
+```
+
+```{python}
+help(minimize)
+```
+
+```{python}
+solution
+```
+
+### Another multivariate normal distribution function from [here](https://github.com/rasbt/python_reference/blob/master/useful_scripts/multivariate_gaussian_pdf.py)
+
+```{python}
+def pdf_multivariate_gauss(x, mu, cov):
+    '''
+    Caculate the multivariate normal density (pdf)
+    
+    Keyword arguments:
+        x = numpy array of a "d x 1" sample vector
+        mu = numpy array of a "d x 1" mean vector
+        cov = "numpy array of a d x d" covariance matrix
+    '''
+    assert(mu.shape[0] > mu.shape[1]), 'mu must be a row vector'
+    assert(x.shape[0] > x.shape[1]), 'x must be a row vector'
+    assert(cov.shape[0] == cov.shape[1]), 'covariance matrix must be square'
+    assert(mu.shape[0] == cov.shape[0]), 'cov_mat and mu_vec must have the same dimensions'
+    assert(mu.shape[0] == x.shape[0]), 'mu and x must have the same dimensions'
+    part1 = 1 / ( ((2* np.pi)**(len(mu)/2)) * (np.linalg.det(cov)**(1/2)) )
+    part2 = (-1/2) * ((x-mu).T.dot(np.linalg.inv(cov))).dot((x-mu))
+    return float(part1 * np.exp(part2))
+
+def test_gauss_pdf():
+    from matplotlib.mlab import bivariate_normal
+
+    x = np.array([[0],[0]])
+    mu  = np.array([[0],[0]])
+    cov = np.eye(2) 
+
+    mlab_gauss = bivariate_normal(x,x)
+    mlab_gauss = float(mlab_gauss[0]) # because mlab returns an np.array
+    impl_gauss = pdf_multivariate_gauss(x, mu, cov)
+
+    print('mlab_gauss:', mlab_gauss)
+    print('impl_gauss:', impl_gauss)
+    assert(mlab_gauss == impl_gauss), 'Implementations of the mult. Gaussian return different pdfs'
+
+
+if __name__ == '__main__':
+    test_gauss_pdf()
+```
+
+```{python}
+help('matplotlib.mlab.bivariate_normal')
+```
+
+Adapted from [source code](https://matplotlib.org/_modules/matplotlib/mlab.html#bivariate_normal) of matplotlib.mlab - now deprecated
+
+```{python}
+def bivariate_normal(xy_tuple, sigma_x=1.0, sigma_y=1.0,
+                     mu_x=0.0, mu_y=0.0, sigma_xy=0.0, magnitude=3.):
+
+    (x, y) = xy_tuple
+    
+    X_mu = X - mu_x
+    Y_mu = Y - mu_y
+
+    rho = sigma_xy / (sigma_x * sigma_y)
+    z = X_mu**2 / sigma_x**2 + Y_mu**2 / sigma_y**2 - 2 * rho * X_mu * Y_mu / (sigma_x*sigma_y)
+    denom = 2 * np.pi * sigma_x *sigma_y * np.sqrt(1 - rho**2)
+    return np.exp(-z / (2 * (1 - rho**2))) / denom
+```
+
+```{python}
+
+```
+
+```{python}
+a = bivariate_normal((X,Y),sigma_x=1.,sigma_y=1.,mu_x=0.,mu_y=0.,sigma_xy=0.)
+```
+
+```{python}
+
+```
+
+```{python}
+initial_guess = (20.,40.,100.,100.,3.)
+```
+
+```{python}
+popt_a, pcov_a = curve_fit(bivariate_normal, (x, y) , Z.ravel(), p0 = initial_guess)
+```
+
+```{python}
+Z_hat_a = bivariate_normal((X,Y),*popt_a)
+```
+
+```{python}
+np.sum((Z_hat_a - Z.ravel())**2)
+```
+
+```{python}
+plt.plot(Z_hat_a)
+```
+
+```{python}
+Z.shape
+```
+
+```{python}
+def twoD_gaus(xdata_tuple, amplitude, x0, y0, sigma_x, sigma_y, theta, offset):
+    (x, y) = xdata_tuple
+    x0 = float(x0)
+    y0 = float(y0)
+    a = (np.cos(theta)**2)/(2*sigma_x**2) + (np.sin(theta)**2)/(2*sigma_y**2)
+    b = -(np.sin(2*theta))/(4*sigma_x**2) + (np.sin(2*theta))/(4*sigma_y**2)
+    c = (np.sin(theta)**2)/(2*sigma_x**2) + (np.cos(theta)**2)/(2*sigma_y**2)
+    g = offset + amplitude*np.exp( - (a*((x-x0)**2) + 2*b*(x-x0)*(y-y0)
+                                     + c*((y-y0)**2)))
+    return g.ravel()
+```
+
+```{python}
+initial_guess = (3,100,100,20,40,0,10)
+```
+
+```{python}
+popt_b, pcov_b = curve_fit(
+    twoD_gaus, (x,y), Z.ravel(), p0 = initial_guess, maxfev = 1000000)
+```
+
+```{python}
+Z_hat_b = twoD_gaus((X,Y),*popt_b)
+```
+
+```{python}
+np.sum((Z_hat_b - Z.ravel())**2)
+```
+
+```{python}
+plt.plot(twoD_gaus((X,Y),*popt_b));
+```
+
+## Discarded code chunks below...
+
+```{python}
+
+```
+
+```{python}
+
+```
+
+```{python}
+a = np.array(PV_15M[['summer_solstice_delta','midday_delta','GHI']])
+a = a[np.argsort(a[:,0])]
+
+#a = a[a[:,1].argsort()] # Sort by summer_solstice_delta
+#a = a[a[:,0].argsort(kind='mergesort')] # Sort by midday_delta
+a = a.reshape(365,96,3)
+
+a[:, :, 1][1]
+```
+
+### Example of bivariate normal distribution from [here](https://scipython.com/blog/visualizing-the-bivariate-gaussian-distribution/)
+
+```{python}
+# Our 2-dimensional distribution will be over variables X and Y
+N = 60
+X_example = np.linspace(-600, 600, N)
+Y_example = np.linspace(-160, 160, N)
+X_example, Y_example = np.meshgrid(X_example, Y_example)
+```
+
+```{python}
+# Mean vector and covariance matrix
+mu = np.array([0.4, .7])
+Sigma = np.array([[ 6000. , -.5], [-.5, 18000.0]])
+```
+
+```{python}
+# Pack X and Y into a single 3-dimensional array
+pos_example = np.empty(X_example.shape + (2,))
+pos_example[:, :, 0] = X_example
+pos_example[:, :, 1] = Y_example
+```
+
+```{python}
+from scipy.stats import multivariate_normal
+F = multivariate_normal(mu, Sigma)
+Z_hat_example = F.pdf(pos_example)
+```
+
+```{python}
+# Create a surface plot.
+fig = plt.figure(figsize=(20,20))
+ax = fig.gca(projection='3d')
+ax.plot_surface(X_example, Y_example, Z_hat_example*5e7, 
+                rstride=1, cstride=1, linewidth=1, antialiased=True,
+                cmap=cm.viridis)
+ax.view_init(45,35)
+plt.show()
+```

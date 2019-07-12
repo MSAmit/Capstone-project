@@ -1,0 +1,683 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.0'
+      jupytext_version: 1.0.4
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+This file is where I got my ideas toghether for a file updater, there are some nice bits and pieces in here.  Ultimately I will republish the useful bits as a straight .py file maybe as a package, or just a collection of functions.
+
+```{python}
+import numpy as np
+import pandas as pd
+import os
+import re
+
+import requests
+from bs4 import BeautifulSoup # To scrape data
+```
+
+```{python}
+import matplotlib 
+import matplotlib.pyplot as plt
+import seaborn as sns; sns.set() 
+```
+
+```{python}
+import unittest
+
+import logging
+logging.basicConfig(level=logging.DEBUG,
+                    format=' %(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+logging.disable(0) # switched debug on. 
+logging.disable(logging.DEBUG) # debug and below not reported.
+# logging.disable(logging.INFO)
+# logging.disable(logging.WARNING)
+# logging.disable(logging.ERROR)
+# logging.disable(logging.CRITICAL)
+```
+
+```{python}
+nemweb_url = r'http://nemweb.com.au/'
+report_archive_root = r'Reports/Archive/'
+report_current_root = r'Reports/Current/'
+rooftop_PV_actual_root = r'ROOFTOP_PV/ACTUAL/'
+rooftop_PV_forecast_root = r'ROOFTOP_PV/FORECAST/'
+
+MMSDM_archive_url = nemweb_url + r'Data_Archive/Wholesale_Electricity/MMSDM/'
+
+ZIPDIR_root = r'E:\Data\nemweb'
+```
+
+from the `not_lacie()` example at the beautiful soup documentation page: https://www.crummy.com/software/BeautifulSoup/bs4/doc/#attrs
+
+```{python}
+def is_year_ref(href):
+    return href and re.compile('(.*\d{4}\/$)').search(href)  # a href and last 5 chars in a string are yyyy/
+
+def is_month_zip(href):
+    return href and re.compile('(.*\d{4}\_\d{2}\.zip$)').search(href)
+
+def is_date_zip(href):
+    return href and re.compile('(.*\d{8}\.zip$)').search(href)
+
+```
+
+```{python}
+def update_rooftop_solar_filecache(path_option):
+    local_zip_files = list()
+    
+    def get_remote_archives(data_file_spec):
+        url = nemweb_url + report_archive_root + data_file_spec
+        try: 
+            r = requests.get(url)
+            if r.ok: return [re.compile('.*\/(.*\d{8}\.zip$)').match(item['href'])[1] 
+                             for item in BeautifulSoup(r.text, 'html.parser').find_all(
+                                 href=is_date_zip)]
+        except: 
+            logger.critical('cannot get to url: %s', url)
+            return None    
+    
+#     for path_option in [rooftop_PV_forecast_root, rooftop_PV_actual_root]: 
+    if not os.path.exists(os.path.join(ZIPDIR_root, path_option)):
+        os.makedirs(os.path.join(ZIPDIR_root, path_option))
+
+    archive_list = get_remote_archives(path_option)
+    logger.debug('Remote archive %s%s%s file list:\n%s\n', 
+                 nemweb_url, report_archive_root, path_option, archive_list)
+
+    for file in archive_list:
+        file_local = os.path.join(ZIPDIR_root, path_option, file)
+
+        if not os.path.exists(file_local):
+            file_url = nemweb_url + report_archive_root + path_option + file
+            logger.info('fetching:\n`%s`', file_url)
+            r = requests.get(file_url, stream=True) # stream=True as data is big
+            with open(file_local, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=2048): # Over 2gig of data, need to stream it in chunks
+                    if chunk: f.write(chunk) # filter out keep-alive new chunks
+            logger.info('\n%s - saved locally\n\n', file_local)
+        else: logger.info('\n%s - already downloaded', file_local)
+        
+    return archive_list        
+
+forecast_PV_file_list = update_rooftop_solar_filecache(rooftop_PV_forecast_root)
+actual_PV_file_list = update_rooftop_solar_filecache(rooftop_PV_actual_root)
+
+logger.info('all files cached:\n%s', forecast_PV_file_list + actual_PV_file_list)
+```
+
+the code below focussess on establishing a dictionary of dataframes for each available forecast:
+the dictionary key is the datetime code as a pd.datetime object/type or just a number in YYYYMMDDHHMM format does it really matter?  
+
+from there we can do some analysis on each data frame, the goal here is to just get to the data!
+
+loading stuff in like this takes a long time and as Peter said: "I'm not going to need it" so make it recursive.
+I think the best thing is to get the two file lists make a dictionary with empty data frames associated with the keys, if the key needs to be populated then do what needs to be done to populate it and chache it for the time of running the file. 
+
+
+```{python}
+from zipfile import ZipFile
+import io
+
+CONTIGUOUS_PV_FORECAST_DATA_DICT = dict()
+CONTIGUOUS_PV_ACTUAL_DATA_DICT = dict()
+
+pv_forecast_archive_flst = os.listdir(os.path.join(ZIPDIR_root, rooftop_PV_forecast_root))
+pv_actual_archive_flst = os.listdir(os.path.join(ZIPDIR_root, rooftop_PV_actual_root))
+```
+
+```{python}
+logger.info('About to load keys for forecasts')
+for f in pv_forecast_archive_flst:
+    logger.info('loading %s', f)
+    with ZipFile(os.path.join(ZIPDIR_root, rooftop_PV_forecast_root, f), 'r') as top_level_zip:
+        internal_zip_flnms = top_level_zip.namelist()
+        for f in internal_zip_flnms:
+            key = re.findall('.*(\d{12})\d{2}\_\d*\.zip$', f)[0]
+            logger.debug(key)
+            CONTIGUOUS_PV_FORECAST_DATA_DICT[key] = pd.DataFrame()
+            
+logger.info('About to load keys for actuals')
+for f in pv_actual_archive_flst:
+    logger.info('loading %s', f)
+    with ZipFile(os.path.join(ZIPDIR_root, rooftop_PV_actual_root, f), 'r') as top_level_zip:
+        internal_zip_flnms = top_level_zip.namelist()
+        for f in internal_zip_flnms:
+            key = re.findall('.*(\d{12})\d{2}\_\d*\.zip$', f)[0]
+            logger.debug(key)
+            CONTIGUOUS_PV_ACTUAL_DATA_DICT[key] = pd.DataFrame()
+```
+
+```{python}
+CPFDD_KEYS = list(CONTIGUOUS_PV_FORECAST_DATA_DICT.keys())
+CPFDD_KEYS.sort()
+CPFDD_KEYS = [pd.to_datetime(x) for x in CPFDD_KEYS]
+logger.info(CPFDD_KEYS)
+```
+
+```{python}
+key_list = list(CONTIGUOUS_PV_FORECAST_DATA_DICT.keys())
+key_list.sort()
+CPVFFL_KEYS = [pd.to_datetime(re.findall('.*(\d{8})\.zip', x)[0]) for x in pv_forecast_archive_flst]
+logger.info("%s", CPVFFL_KEYS)
+CPVFD_KEYS = [pd.to_datetime(x) for x in key_list]
+logger.info("%s", CPVFD_KEYS)
+```
+
+```{python}
+def get_index(dtime, dtime_list):
+    if dtime < dtime_list[0]: 
+        logger.error('no forecasts available for datetime %s, next forecast %s', dtime, dtime_list[0])
+        return -1
+    mask = [t <= dtime for t in dtime_list]
+    for i, x in enumerate(mask[:-1]):
+        if x != mask[i+1]: 
+            return dtime_list[i]
+    logger.error('last forecast may be available for datetime %s, last forecast %s', dtime, dtime_list[-1]) 
+    return -1
+
+datetime_2_key = lambda dtime:str(dtime.minute + 
+                                  100*(dtime.hour + 
+                                       100*(dtime.day + 
+                                            100*(dtime.month + 
+                                                 100*dtime.year))))
+```
+
+```{python}
+def load_forecast_file(date_time):
+    pass
+
+def get_forecast_df(date_time):
+    df = CONTIGUOUS_PV_FORECAST_DATA_DICT[datetime_2_key(date_time)]
+    if df.isnull:
+        load_forecast_file(date_time)
+    
+    return df 
+
+_ = get_forecast_df(pd.to_datetime("2018-05-01 07:30"))
+```
+
+```{python}
+from zipfile import ZipFile, ZipInfo
+import io
+
+pv_frcst_arch_flst = os.listdir(os.path.join(ZIPDIR_root, rooftop_PV_forecast_root))
+# pv_forcst_arch_dtlst = [re.compile('.*(\d{8})\.zip$').match(item)[1] 
+#                                   for item in pv_forcst_arch_flst]
+
+def get_all_p_dfs_from_zip(file_spec, file_type):
+    output_dict = dict()
+    with ZipFile(os.path.join(ZIPDIR_root, file_type, file_spec), 'r') as top_level_zip:
+        logger.debug(top_level_zip.namelist())
+        for internal_zip_il in top_level_zip.infolist():
+            logger.debug(internal_zip_il)
+            with ZipFile(io.BytesIO(top_level_zip.read(internal_zip_il))) as interal_zip:
+                internal_csv = interal_zip.infolist()[0]
+                logger.debug(internal_csv.filename)
+                
+                df_in = pd.read_csv(interal_zip.open(internal_csv.filename), 
+                                    skiprows=[0], header='infer', encoding='ansi')
+                df_in = df_in[:-1] # get rid of the last line
+                df_in.drop(labels=df_in.columns[0:5], axis=1, inplace=True)
+                df_in.drop(labels=df_in.columns[-1], axis=1, inplace=True)
+                df_in['INTERVAL_DATETIME'] = pd.to_datetime(df_in['INTERVAL_DATETIME'])
+                df_in.set_index(['REGIONID', 'INTERVAL_DATETIME'], inplace=True)
+                
+                dict_key = re.compile('.*(\d{12})\d{2}\_\d*\.csv$').match(internal_csv.filename)[1]
+                logger.debug('%s\n%s', dict_key, df_in.head())
+                output_dict[dict_key] = df_in      
+    return output_dict
+
+logger.info('About to load data')
+for f in pv_frcst_arch_flst[-26:]:
+    logger.info('loading %s', f)
+    CONTIGUOUS_PV_FORECAST_DATA_DICT.update(get_all_p_dfs_from_zip(f, rooftop_PV_forecast_root))
+
+logger.info('the contiguous data has %s keys', len(CONTIGUOUS_PV_FORECAST_DATA_DICT))
+```
+
+```{python}
+pv_act_arch_flst = os.listdir(os.path.join(ZIPDIR_root, rooftop_PV_actual_root))
+# pv_forcst_arch_dtlst = [re.compile('.*(\d{8})\.zip$').match(item)[1] 
+#                                   for item in pv_forcst_arch_flst]
+
+def get_all_a_dfs_from_zip(file_spec, file_type):
+    output_dict = dict()
+    with ZipFile(os.path.join(ZIPDIR_root, file_type, file_spec), 'r') as top_level_zip:
+        logger.debug(top_level_zip.namelist())
+        for internal_zip_il in top_level_zip.infolist():
+            logger.debug(internal_zip_il)
+            with ZipFile(io.BytesIO(top_level_zip.read(internal_zip_il))) as interal_zip:
+                internal_csv = interal_zip.infolist()[0]
+                logger.debug(internal_csv.filename)
+                
+                df_in = pd.read_csv(interal_zip.open(internal_csv.filename), 
+                                    skiprows=[0], header='infer', encoding='ansi')
+                df_in = df_in[:-1] # get rid of the last line
+                df_in.drop(labels=df_in.columns[0:4], axis=1, inplace=True)
+                df_in.drop(labels=df_in.columns[-1], axis=1, inplace=True)
+                df_in['INTERVAL_DATETIME'] = pd.to_datetime(df_in['INTERVAL_DATETIME'])
+                df_in.set_index(['REGIONID', 'INTERVAL_DATETIME'], inplace=True)
+                
+                dict_key = re.compile('.*(\d{12})\d{2}\_\d*\.csv$').match(internal_csv.filename)[1]
+                logger.debug('%s\n%s', dict_key, df_in.head())
+                output_dict[dict_key] = df_in      
+    return output_dict
+
+logger.info('About to load data')
+for f in pv_act_arch_flst[-26:]:
+    logger.info('loading %s', f)
+    CONTIGUOUS_PV_ACTUAL_DATA_DICT.update(get_all_a_dfs_from_zip(f, rooftop_PV_actual_root))
+```
+
+```{python}
+logger.info('the contiguous data has %s keys', len(CONTIGUOUS_PV_ACTUAL_DATA_DICT))
+```
+
+```{python}
+logger.info(CONTIGUOUS_PV_ACTUAL_DATA_DICT.keys())
+```
+
+because time is the enemy here I have to just load the actual solar data and thern do a comparison:
+
+the latest data is in the following director
+
+```{python}
+SOLAR_DATA_DIR = 'E:\Data\1min Solar\023034'
+
+raw_solar_ghi = pd.read_csv('./data/2018-05-may-1minute-Global.csv', index_col=0, infer_datetime_format=True)
+raw_solar_ghi.index = pd.to_datetime(raw_solar_ghi.index)
+raw_solar_ghi.plot()
+plt.show()
+
+solar_ghi = raw_solar_ghi.resample('30T', label='right').mean()
+solar_ghi.plot()
+plt.show()
+solar_ghi.info()
+```
+
+```{python}
+
+```
+
+Now just get the forecast dataframe for say 0730 on May the first, because we know it exists not going searchn for it.
+
+```{python}
+from bokeh.plotting import figure
+from bokeh.io import output_file, show
+
+dt_range = pd.date_range(start='2018-05-01', end='2018-06-01', freq='D')
+
+roof_pv = pd.DataFrame()
+for date in dt_range:
+    roof_pv = roof_pv.append(CONTIGUOUS_PV_ACTUAL_DATA_DICT[datetime_2_key(date)])
+
+roof_pv.info()
+```
+
+```{python}
+sa_rpv = roof_pv.loc['SA1']
+sa_rpv.index = pd.to_datetime(sa_rpv.index)
+sa_rpv['GHI'] = solar_ghi.loc[sa_rpv.index]
+```
+
+```{python}
+sa_rpv['GHI'].plot(); plt.show()
+```
+
+```{python}
+p = figure(x_axis_label='date and time', y_axis_label='Solar Ouptuts')
+p.x(sa_rpv.index, sa_rpv.GHI, color='blue')
+p.line(sa_rpv.index, sa_rpv.GHI, color='blue')
+p.circle(sa_rpv.index, sa_rpv.POWER, color='green')
+p.line(sa_rpv.index, sa_rpv.POWER, color='green')
+# p.x(sa_rpv.index, sa_rpv.POWERPOE50, color='red')
+# p.line(sa_rpv.index, sa_rpv.POWERPOE50, color='red')
+output_file('check_times.html')
+show(p)
+```
+
+```{python}
+q = figure(x_axis_label='BOM GHI', y_axis_label='NEM')
+# q.circle(sa_rpv.GHI, sa_rpv.POWERMEAN, alpha=0.3, color='black')
+q.circle(sa_rpv.GHI, sa_rpv.POWER, alpha=0.2, color='green')
+output_file('scatters.html')
+show(q)
+```
+
+```{python}
+sa_rpv[['GHI', 'POWER']].to_csv('./data/GHI-NEMPV.csv')
+```
+
+```{python}
+sa_rpv[['GHI', 'POWER']].plot()
+plt.show()
+```
+
+```{python}
+sa_rpv[(sa_rpv.GHI > 50.0) & (sa_rpv.POWER > 50.0)].plot(kind='scatter', y='GHI', x='POWER', color='green', alpha=0.3)
+sa_rpv[(sa_rpv.GHI < 50.0) & (sa_rpv.POWER < 50.0)].plot(kind='scatter', y='GHI', x='POWER', color='green', alpha=0.3)
+sa_rpv[(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)].plot(kind='scatter', y='GHI', x='POWER', color='green', alpha=0.3)
+sa_rpv[['GHI', 'POWER']].plot(kind='scatter', y='GHI', x='POWER', color='blue', alpha=0.3)
+plt.show()
+```
+
+```{python}
+import seaborn as sns
+
+sns.jointplot(x='GHI', y='POWER', data=sa_rpv[(sa_rpv.GHI >= 0.0) & (sa_rpv.POWER >= 0.0)])
+plt.show()
+sns.regplot(x='GHI', y='POWER', data=sa_rpv[(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)], color='m', 
+           scatter_kws={'alpha':0.1},
+           line_kws={'color':'red', 'lw':0.5})
+plt.show()
+
+sa_rpv['xPWR'] = sa_rpv.POWER / 0.73
+sns.violinplot(data=sa_rpv[['GHI', 'POWER', 'xPWR']][(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)])
+plt.show()
+```
+
+```{python}
+sns.tsplot(data=sa_rpv['GHI'], color='g')
+sns.tsplot(data=sa_rpv['xPWR'], color='r')
+plt.show()
+```
+
+```{python}
+import seaborn as sns
+
+sa_rpv['LOGPWR'] = np.log(sa_rpv[sa_rpv.POWER > 0.0].POWER)
+sa_rpv['LOGGHI'] = np.log(sa_rpv[sa_rpv.GHI > 0.0].GHI)
+
+sns.jointplot(x='GHI', y='POWER', data=sa_rpv[(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)])
+plt.show()
+sns.regplot(x='GHI', y='LOGPWR', data=sa_rpv[(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)], 
+            color='m',
+            scatter_kws={'alpha':0.1},
+            line_kws={'color':'red', 'lw':0.5})
+plt.show()
+
+
+sns.jointplot(y='LOGGHI', x='LOGPWR', data=sa_rpv[(sa_rpv.GHI > 10.0) & (sa_rpv.POWER > 10.0)])
+plt.show()
+
+sns.regplot(y='LOGGHI', x='LOGPWR', data=sa_rpv[(sa_rpv.GHI > 10.0) & (sa_rpv.POWER > 10.0)], 
+            color='m',
+            scatter_kws={'alpha':0.1},
+            line_kws={'color':'red', 'lw':0.5})
+plt.show()
+```
+
+```{python}
+from scipy.stats import linregress
+
+lr = linregress(sa_rpv[(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)].GHI.get_values(), 
+               sa_rpv[(sa_rpv.GHI > 0.0) & (sa_rpv.POWER > 0.0)].POWER.get_values())
+logger.info(lr)
+```
+
+```{python}
+dates_range = pd.date_range(start='2018-05-01 07:30', end='2018-05-01 08:30', freq='30T')
+```
+
+```{python}
+min_to_ns = lambda min: min*60*1000000000
+timedelta_days = lambda days: pd.to_timedelta(min_to_ns(days*24*60))
+```
+
+```{python}
+def get_forecast_df(time_window_range, region):
+    rtn_df = pd.DataFrame()
+    global CONTIGUOUS_PV_FORECAST_DATA_DICT
+    
+    # the offsets seem to ensure there is at least one month in 
+    # the timeRange list
+    startTime = time_window_range[0] - pd.to_timedelta(timedelta_days(1))
+    endTime = time_window_range[-1] + pd.to_timedelta(timedelta_days(1))
+    timeRange =  pd.date_range(start=startTime, end=endTime, freq='D')
+        
+    logger.debug('looking for pv forecast for %s', region)
+    logger.debug('ranging from %s to %s', startTime, endTime)
+    logger.debug('months from %s to %s', startTime.month, endTime.month)
+    logger.debug('range data is\n%s', timeRange)
+    
+    start_time_tag = datetime_2_key(get_index(startTime, CPFDD_KEYS))
+    
+    logger.info('initially getting data for: %s', start_time_tag)
+
+    # just going to assume that I need the one file for now:
+    if CONTIGUOUS_PV_FORECAST_DATA_DICT[start_time_tag].isnull:
+        # get the data filled:
+        pass
+    else: rtn_df = CONTIGUOUS_PV_FORECAST_DATA_DICT[start_time_tag]
+        
+#     for ymt_tag in year_month_tags:
+#         if (ymt_tag) not in CONTIGUOUS_DATA_DICT[data_spec]:
+#             tmp_tag_df = get_dataframe_from_zip(file_spec, yyyy, mm)
+#             tmp_tag_df = refine_data(tmp_tag_df, data_spec, field)
+#             CONTIGUOUS_DATA_DICT[data_spec][ymt_tag] = tmp_tag_df
+#         else: tmp_tag_df = CONTIGUOUS_DATA_DICT[data_spec][ymt_tag]
+#         rtn_df = rtn_df.append(tmp_tag_df)
+        
+#     logger.debug('\n%s', rtn_df.loc[region])
+    return None
+    return rtn_df.loc[startTime:endTime, region]
+```
+
+```{python}
+def get_PV_forecast(startTime, numberOfIntervals, regionId='SA1'):
+    logger.info('looking for %s intervals starting at %s in %s', numberOfIntervals, startTime, regionId)
+    forecast_range = pd.date_range(start=startTime, 
+                                   periods=numberOfIntervals, freq='30T')
+    forecastPV = get_forecast_df(forecast_range, regionId)
+
+#     logger.debug('forecasts\n%s', forecastPV.loc[startTime])    
+    return forecastPV
+
+```
+
+```{python}
+horizonIntervals = 3*24*2 # 3 days by 24 hours/day by 2 intervals/hour
+
+dt_range = pd.date_range(start='2017-10-13 15:30', end='2018-01-31 23:30:00', freq='30T')
+dt_range = pd.date_range(start='2017-10-13 15:30', end='2017-10-13 16:30', freq='30T')
+for t in dt_range:
+    get_PV_forecast(t, horizonIntervals, regionId='SA1' )
+    
+```
+
+```{python}
+a_forecast = get_PV_forecast(pd.to_datetime('2017-12-01 '), 7*48, regionId='SA1' )
+```
+
+```{python}
+list(CONTIGUOUS_PV_FORECAST_DATA_DICT.keys())[-5:]
+```
+
+```{python}
+CONTIGUOUS_PV_FORECAST_DATA_DICT['201805010000'].loc['SA1', 'POWERMEAN'].to_csv('./data/NEM_Forecast.csv')
+```
+
+```{python}
+dt_range = pd.date_range(start='2017-10-13 15:30', end='2018-01-31 23:30:00', freq='30T')
+dt_range = pd.date_range(start='2017-10-13 15:30', end='2017-10-13 23:30', freq='30T')
+for t in dt_range:
+    logger.info('%s is at or after index %s ', t, get_index(t, CPFDD_KEYS))
+    logger.info('using key %s', datetime_2_key(get_index(t, CPFDD_KEYS)))
+    
+```
+
+get the forecasts from inside the files, what did I do with the other stuff, from memory I fetch the file to memory only if I don't have the forecast.
+
+```{python}
+# CONTIGUOUS_PV_DATA_DICT = dict()
+def internal_forecast_filespec(datetimespec):
+    filename_prefix = r'(.*PUBLIC_ROOFTOP_PV_FORECAST_'
+    filename_postfix = r'_\d*\.zip)$'
+    return filename_prefix + filespec + filename_postfix
+
+
+def get_PV_df(timewindow_range, regionId):
+    rtn_df = pd.DataFrame()
+    global CONTIGUOUS_PV_DATA_DICT
+    
+    startTime = time_window_range[0]
+    endTime = time_window_range[0]
+    return rtn_df
+    
+
+def get_pv_forecast(startTime, numberOfIntervals, regionId='SA1'):
+    logger.info('looking for %s intervals starting at %s in %s', numberOfIntervals, startTime, regionId)
+
+    forecast_range = pd.date_range(start=startTime, 
+                                   periods=numberOfIntervals, freq='30T')
+    forecast_PV_df = get_PV_df(forecast_range, regionId)
+    forecast_PV_ts = forecast_PV_df.copy()
+    return forecast_PV_ts
+
+```
+
+the code above seems to do what I need: i.e. find the item in the list that I need in order to get to the appropriate zip file.  Maybe I can just do it with integers like I did it last time. 
+
+I think I had a dictionary of files/dataframes I had already opened and all of the dataframes within that dictionary were keyed with an integer, in this case I have lots to do 
+
+```{python}
+logger.info(pd.to_datetime('2017-10-13 15:30').isoweekday())
+logger.info(pd.to_datetime('2017-10-12 01:30').isoweekday())
+```
+
+```{python}
+def get_year_urls(url):
+    try: 
+        r = requests.get(url)
+        if r.ok: return [item['href'] for item in
+                         BeautifulSoup(r.text, 'html.parser').find_all(href=is_year_ref)]
+    except: 
+        logger.critical('cannot get to url: %s', url)
+        return None
+
+def get_remote_zip(year_rl):
+    url = nemweb_url + year_rl
+    try: 
+        r = requests.get(url)
+        if r.ok: return [item['href'][-17:] for item in
+                         BeautifulSoup(r.text, 'html.parser').find_all(href=is_month_zip)]
+    except: 
+        logger.critical('cannot get to url: %s', url)
+        return None
+    
+def get_local_zip(year_rl):
+    return os.listdir(os.path.join(ZIPDIR_root, year_rl[-5:-1]))
+```
+
+the code below needs to be tailored to the zip file structure of the solar data archive ... in real time there is no neccessity for the zip within a zip thing, as the files are just the compressed `csv`'s
+
+```{python}
+def find_filespec_in_zip(source_zip, search_spec):
+    found_file = [re.match(search_spec, name).group(0) for name in source_zip.namelist() 
+                  if re.match(search_spec, name)]
+    return found_file[0] if len(found_file)==1 else None 
+
+
+def get_dataframe_from_csv(source_zip, search_spec):
+    """a bit of a hack here as we are guessign there is only one CSV per zip file"""
+    internal_zip_name = find_filespec_in_zip(source_zip, search_spec)
+    logger.debug('About to read:\n%s', internal_zip_name)
+    
+    try:
+        zip_file_data = ZipFile(io.BytesIO(source_zip.read(internal_zip_name)))
+#         dfs = {csv_f.filename: pd.read_csv(zip_file_data.open(csv_f.filename), skiprows=[0])
+#                for csv_f in zip_file_data.infolist() 
+#                if csv_f.filename.endswith('.CSV')}
+        dfs = [pd.read_csv(zip_file_data.open(csv_f.filename), skiprows=[0])
+               for csv_f in zip_file_data.infolist() 
+               if csv_f.filename.endswith('.CSV')]
+    
+    except BadZipFile: logger.error('%s is not a zip file', internal_zip_name)
+        
+    return dfs[0]
+
+
+def get_dataframe_from_zip(file_spec, year, month, day):
+    zip_year = '{:04n}'.format(year)
+    zip_month = 'MMSDM_{:04n}_{:02n}.zip'.format(year, month)
+    logger.debug('looking at %s', os.path.join(zip_year, zip_month)) 
+  
+    try:
+        top_level_zip = ZipFile(os.path.join(ZIPDIR_root, zip_year, zip_month), 'r')
+        dataFrame = get_dataframe_from_csv(top_level_zip, file_spec)
+        logger.debug('key:\n%s\n', file_spec)
+            
+    except BadZipFile: logger.error('%s is a bad zip file', os.path.join(ZIPDIR_root, zip_year, zip_month))
+    
+    return dataFrame
+```
+
+after getting the solar data from the service I now need to expunge the csv inside the csv 
+
+
+looks like the archive has gotten considerably more packed around 2018-03-08, before then archives are of 0130, 0730, 1330, 1930, only then after that they become available every 30 minutes!
+
+
+2018-07-11 there seems to be a problem with the code below. I cannot remember where I was up to with the code below but instead of using it I will just come up with new code to read the archive and go to the current directory as well. 
+
+```{python}
+def update_zips():
+    remote_zip_files = list() 
+    local_zip_files = list()
+
+    for year_rl in get_year_urls(MMSDM_archive_url): 
+        remote_zip_files.extend(get_remote_zip(year_rl))  
+        local_zip_files.extend(get_local_zip(year_rl))    
+
+    logger.debug('remote file names: \n%s', remote_zip_files)
+    logger.debug('local file names: \n%s', local_zip_files)
+
+    remote_file_set = set(); remote_file_set = set(remote_zip_files)
+    local_file_set = set(); local_file_set = set(local_zip_files)
+
+    missing_files = remote_file_set - local_file_set #assume there are more remotes than locals
+
+    logger.debug('The set of missing files:\n%s', missing_files)
+
+    for zip_file in missing_files:
+        year = zip_file[6:10]
+        file_url = MMSDM_archive_url+year+'/'+zip_file
+        file_local = os.path.join(ZIPDIR_root, year, zip_file)
+        logger.info('looking for remote:\n%s', file_url)
+        logger.info('and saving to local:\n%s', file_local)
+
+        if not os.path.exists(os.path.join(ZIPDIR_root, year)): 
+            os.makedirs(os.path.join(ZIPDIR_root, year))
+
+        # the following bits of code need to be done where there is a good data connection 
+        # i.e. not at home:
+
+        r = requests.get(file_url, stream=True) # stream=True as data is big
+        with open(file_local, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=512): # Over 2gig of data, need to stream it in chunks
+                if chunk: f.write(chunk) # filter out keep-alive new chunks
+
+        logger.info('\n%s - saved locally', file_local)
+    else: logger.info('No new files to transfer.')
+        
+    return None
+```
+
+Using the prototype `monkey see, monkey do` for unit testing from: https://stackoverflow.com/questions/37895781/unable-to-run-unittests-main-function-in-ipython-jupyter-notebook#38012249
+
+the return code is alway going to be None, but now I can run this in stand alone, or as an integrated module.
+
+```{python}
+
+```
